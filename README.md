@@ -92,6 +92,21 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 不是非空数组或元素不是对象为 `422 invalid_samples`；时间戳缺失、非有限、为布尔值或未严格递增为 `422 invalid_timestamp`；`current_a`/`voltage_v` 缺失、非有限或为布尔值为 `422 invalid_measurement`；过滤选项类型或范围不符为 `422 invalid_filter_options`。
 
+## 充电热保护
+
+`POST /v1/battery/thermal/protect`（也可直接调用 `Service.protect_thermal`）按电芯温度与期望充电电流生成限流决定。
+
+请求字段：
+
+- `protection`（必填）：对象，含正有限数 `max_charge_current_a`，以及满足 `recovery_temperature_c < warning_temperature_c < critical_temperature_c` 的三个有限温度阈值。
+- `samples`（必填）：非空数组，每项为对象，含严格递增的有限 `timestamp_s`、有限 `temperature_c` 和非负有限 `requested_current_a`；布尔值不作为数值接受。
+
+温度低于告警阈值时热电流上限为 `max_charge_current_a`；处于告警与临界阈值之间时上限随温度线性降至零；达到临界阈值时上限为零并锁存切断。锁存后仅在温度降到恢复阈值或更低时解除，并在该点重新按温区计算。`allowed_current_a` 取期望电流与热上限的较小值；`state` 在低温区、线性降额区和锁存期依次为 `normal`、`derated`、`cutoff`。
+
+响应 `decisions` 与输入等长同序，每项含 `timestamp_s`（原样保留）、`allowed_current_a`、`thermal_limit_a`、`state`；顶层 `final_state` 取末项状态，`cutoff_count` 统计进入 cutoff 的次数。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`protection` 结构、数值或阈值顺序非法为 `422 invalid_protection_config`；`samples` 结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；温度非法为 `422 invalid_temperature`；期望电流非法为 `422 invalid_current`。
+
 ## 验证
 
 ```bash
