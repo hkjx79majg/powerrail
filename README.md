@@ -44,6 +44,26 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`422` 字段错误包括 `invalid_nominal_capacity`、`invalid_measurements`（数组类型、数量或元素类型非法）、`invalid_timestamp`、`invalid_capacity_measurement`、`invalid_throughput`（累计放电量缺失、非有限、为负或下降）、`invalid_end_of_life_soh`。
 
+## 功耗预算分配
+
+`POST /v1/power/budget/allocate`（也可直接调用 `Service.allocate_power_budget`）在可用功率预算内按优先级为负载分配功率。
+
+请求字段：
+
+- `available_power_w`（必填）：非负有限数可用功率（瓦）。
+- `reserve_power_w`（可选）：非负有限数保留功率，默认 `0`，不得超过可用功率。
+- `loads`（必填）：非空数组，每项为对象，含：
+  - `id`：非空字符串，数组内唯一；
+  - `demand_power_w`：非负有限数需求功率；
+  - `min_power_w`：非负有限数最低功率，不得超过需求功率；
+  - `priority`：`[0, 100]` 内整数，数值越大优先级越高。
+
+可分配功率为 `available_power_w - reserve_power_w`。分配分两阶段：先按优先级从高到低满足各负载 `min_power_w`，同一优先级最低功率之和超过余量时按各自最低功率比例分配，更低优先级归零；再将剩余功率按同样优先级顺序补足需求，同级无法全额补足时按各自未满足需求（`demand_power_w` 减去已分配）的比例分配。任何分配不为负、不超过需求，总额不突破可分配功率；调用不修改请求对象，负载换序后按 `id` 对应的结果不变。
+
+响应 `allocations` 与输入 `loads` 等长同序，每项含 `id`、`allocated_power_w`、`shortfall_power_w`（需求减分配，不为负）与 `state`：达到需求（含零需求）为 `powered`，零分配且需求为正为 `shed`，其余为 `limited`。`allocated_power_w`、`unallocated_power_w` 汇总已分配与剩余可分配功率；全部需求满足时 `status` 为 `satisfied`，否则为 `constrained`。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；预算字段缺失、为布尔值、非有限数、为负或保留量超 available 为 `422 invalid_budget`；`loads` 非非空数组或元素非对象为 `422 invalid_loads`；`id` 缺失、为空或重复为 `422 invalid_load_id`；`demand_power_w`/`min_power_w` 缺失或违反数值范围为 `422 invalid_load_power`；`priority` 缺失、为布尔值、非整数或越界为 `422 invalid_priority`。
+
 ## 验证
 
 ```bash

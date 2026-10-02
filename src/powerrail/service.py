@@ -297,6 +297,173 @@ class Service:
             "projection_status": projection_status,
         }
 
+    def allocate_power_budget(self, payload: Any) -> dict[str, Any]:
+        """Allocate an available power budget across prioritized loads.
+
+        Minimum power is satisfied first, highest priority tier first; a
+        tier whose minimums exceed the remaining budget splits it
+        proportionally to each load's minimum and lower tiers get nothing.
+        Leftover power then tops up unmet demand in the same priority
+        order, split proportionally to unmet demand within a tier.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        available = payload.get("available_power_w")
+        if not _is_finite_number(available) or available < 0:
+            raise ApiError(
+                422,
+                "invalid_budget",
+                "available_power_w must be a non-negative finite number",
+            )
+        reserve = payload.get("reserve_power_w", 0)
+        if not _is_finite_number(reserve) or reserve < 0:
+            raise ApiError(
+                422,
+                "invalid_budget",
+                "reserve_power_w must be a non-negative finite number",
+            )
+        if reserve > available:
+            raise ApiError(
+                422,
+                "invalid_budget",
+                "reserve_power_w must not exceed available_power_w",
+            )
+
+        loads = payload.get("loads")
+        if not isinstance(loads, list) or not loads:
+            raise ApiError(422, "invalid_loads", "loads must be a non-empty array")
+        for load in loads:
+            if not isinstance(load, dict):
+                raise ApiError(422, "invalid_loads", "each load must be an object")
+
+        seen_ids: set[str] = set()
+        for load in loads:
+            load_id = load.get("id")
+            if not isinstance(load_id, str) or not load_id:
+                raise ApiError(
+                    422, "invalid_load_id", "each load id must be a non-empty string"
+                )
+            if load_id in seen_ids:
+                raise ApiError(422, "invalid_load_id", "load ids must be unique")
+            seen_ids.add(load_id)
+
+        for load in loads:
+            demand = load.get("demand_power_w")
+            minimum = load.get("min_power_w")
+            if (
+                not _is_finite_number(demand)
+                or demand < 0
+                or not _is_finite_number(minimum)
+                or minimum < 0
+                or minimum > demand
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "demand_power_w and min_power_w must be non-negative finite "
+                    "numbers with min_power_w not exceeding demand_power_w",
+                )
+
+        for load in loads:
+            priority = load.get("priority")
+            if (
+                not isinstance(priority, int)
+                or isinstance(priority, bool)
+                or not 0 <= priority <= 100
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_priority",
+                    "priority must be an integer within [0, 100]",
+                )
+
+        parsed = [
+            (
+                load["id"],
+                float(load["demand_power_w"]),
+                float(load["min_power_w"]),
+                load["priority"],
+            )
+            for load in loads
+        ]
+        priorities = sorted({entry[3] for entry in parsed}, reverse=True)
+
+        allocatable = float(available) - float(reserve)
+        remaining = allocatable
+        allocated = [0.0] * len(parsed)
+
+        # Phase 1: satisfy minimum power, highest priority tier first.
+        for priority in priorities:
+            indices = [i for i, entry in enumerate(parsed) if entry[3] == priority]
+            total_min = sum(parsed[i][2] for i in indices)
+            if total_min <= remaining:
+                for i in indices:
+                    allocated[i] = parsed[i][2]
+                remaining -= total_min
+            else:
+                if total_min > 0:
+                    for i in indices:
+                        allocated[i] = remaining * parsed[i][2] / total_min
+                remaining = 0.0
+
+        # Phase 2: top up unmet demand with the leftover power.
+        for priority in priorities:
+            indices = [i for i, entry in enumerate(parsed) if entry[3] == priority]
+            gaps = [parsed[i][1] - allocated[i] for i in indices]
+            total_gap = sum(gaps)
+            if total_gap <= 0:
+                continue
+            if total_gap <= remaining:
+                for i in indices:
+                    allocated[i] = parsed[i][1]
+                remaining -= total_gap
+            else:
+                for i, gap in zip(indices, gaps):
+                    allocated[i] += remaining * gap / total_gap
+                remaining = 0.0
+
+        allocations: list[dict[str, Any]] = []
+        total_allocated = 0.0
+        all_met = True
+        for i, (load_id, demand, _minimum, _priority) in enumerate(parsed):
+            power = allocated[i]
+            if power < 0.0:
+                power = 0.0
+            elif power > demand:
+                power = demand
+            shortfall = demand - power
+            if shortfall < 0.0:
+                shortfall = 0.0
+            if power >= demand:
+                state = "powered"
+            elif power <= 0.0:
+                state = "shed"
+            else:
+                state = "limited"
+            if shortfall > 0.0:
+                all_met = False
+            total_allocated += power
+            allocations.append(
+                {
+                    "id": load_id,
+                    "allocated_power_w": power,
+                    "shortfall_power_w": shortfall,
+                    "state": state,
+                }
+            )
+
+        unallocated = allocatable - total_allocated
+        if unallocated < 0.0:
+            unallocated = 0.0
+
+        return {
+            "status": "satisfied" if all_met else "constrained",
+            "allocated_power_w": total_allocated,
+            "unallocated_power_w": unallocated,
+            "allocations": allocations,
+        }
+
     @staticmethod
     def _parse_ocv_curve(
         curve: Any,
