@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .service import ApiError, Service
 
 SOC_ROUTE = "/v1/battery/soc/estimate"
+HEALTH_ROUTE = "/v1/battery/health/estimate"
 
 
 def env_address() -> tuple[str, int]:
@@ -38,7 +39,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
-        if self.path != SOC_ROUTE:
+        if self.path not in (SOC_ROUTE, HEALTH_ROUTE):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
         try:
@@ -53,8 +54,12 @@ class Handler(BaseHTTPRequestHandler):
                 400, {"error": {"code": "invalid_json", "message": "request body must be valid JSON"}}
             )
             return
+        if self.path == HEALTH_ROUTE:
+            handler = self.service.estimate_health
+        else:
+            handler = self.service.estimate_soc
         try:
-            result = self.service.estimate_soc(payload)
+            result = handler(payload)
         except ApiError as exc:
             self.send_json(
                 exc.status, {"error": {"code": exc.code, "message": exc.message}}

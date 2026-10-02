@@ -15,6 +15,7 @@ from . import __version__
 DEFAULT_REST_CURRENT_A = 0.05
 DEFAULT_REST_DURATION_S = 300.0
 DEFAULT_OCV_WEIGHT = 0.2
+DEFAULT_END_OF_LIFE_SOH = 0.8
 
 
 class ApiError(Exception):
@@ -167,6 +168,132 @@ class Service:
             )
 
         return {"estimates": estimates, "final_soc": soc}
+
+    def estimate_health(self, payload: Any) -> dict[str, Any]:
+        """Validate and run a battery health (SoH) and cycle-life estimate."""
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        nominal_capacity = payload.get("nominal_capacity_ah")
+        if not _is_finite_number(nominal_capacity) or nominal_capacity <= 0:
+            raise ApiError(
+                422,
+                "invalid_nominal_capacity",
+                "nominal_capacity_ah must be a positive finite number",
+            )
+
+        measurements = payload.get("measurements")
+        if not isinstance(measurements, list) or len(measurements) < 2:
+            raise ApiError(
+                422, "invalid_measurements", "measurements must contain at least two items"
+            )
+
+        eol_soh = payload.get("end_of_life_soh", DEFAULT_END_OF_LIFE_SOH)
+        if not _is_finite_number(eol_soh) or not 0 <= eol_soh <= 1:
+            raise ApiError(
+                422,
+                "invalid_end_of_life_soh",
+                "end_of_life_soh must be a finite number within [0, 1]",
+            )
+
+        timestamps: list[float] = []
+        measured_capacities: list[float] = []
+        cumulative_discharges: list[float] = []
+        previous_timestamp: float | None = None
+        previous_discharge: float | None = None
+        for measurement in measurements:
+            if not isinstance(measurement, dict):
+                raise ApiError(
+                    422, "invalid_measurements", "each measurement must be an object"
+                )
+
+            timestamp = measurement.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+
+            measured_capacity = measurement.get("measured_capacity_ah")
+            if not _is_finite_number(measured_capacity) or measured_capacity <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_capacity_measurement",
+                    "measured_capacity_ah must be a positive finite number",
+                )
+
+            cumulative_discharge = measurement.get("cumulative_discharge_ah")
+            if (
+                not _is_finite_number(cumulative_discharge)
+                or cumulative_discharge < 0
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_throughput",
+                    "cumulative_discharge_ah must be a non-negative finite number",
+                )
+            if (
+                previous_discharge is not None
+                and cumulative_discharge < previous_discharge
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_throughput",
+                    "cumulative_discharge_ah must be non-decreasing",
+                )
+
+            timestamps.append(timestamp)
+            measured_capacities.append(measured_capacity)
+            cumulative_discharges.append(cumulative_discharge)
+            previous_timestamp = timestamp
+            previous_discharge = cumulative_discharge
+
+        estimates: list[dict[str, Any]] = []
+        soh_values: list[float] = []
+        equivalent_cycles: list[float] = []
+        for index in range(len(measurements)):
+            soh = measured_capacities[index] / nominal_capacity
+            if soh < 0.0:
+                soh = 0.0
+            elif soh > 1.0:
+                soh = 1.0
+            cycles = cumulative_discharges[index] / nominal_capacity
+            soh_values.append(soh)
+            equivalent_cycles.append(cycles)
+            estimates.append(
+                {
+                    "timestamp_s": timestamps[index],
+                    "soh": soh,
+                    "equivalent_cycles": cycles,
+                }
+            )
+
+        latest_soh = soh_values[-1]
+        consumed_cycles = equivalent_cycles[-1]
+        if latest_soh <= eol_soh:
+            remaining_cycles: float | None = 0
+            projection_status = "end_of_life"
+        else:
+            cycle_span = equivalent_cycles[-1] - equivalent_cycles[0]
+            soh_drop = soh_values[0] - soh_values[-1]
+            if cycle_span > 0 and soh_drop > 0:
+                degradation_rate = soh_drop / cycle_span
+                remaining_cycles = (latest_soh - eol_soh) / degradation_rate
+                projection_status = "projected"
+            else:
+                remaining_cycles = None
+                projection_status = "insufficient_trend"
+
+        return {
+            "estimates": estimates,
+            "latest_soh": latest_soh,
+            "consumed_cycles": consumed_cycles,
+            "remaining_cycles": remaining_cycles,
+            "projection_status": projection_status,
+        }
 
     @staticmethod
     def _parse_ocv_curve(
