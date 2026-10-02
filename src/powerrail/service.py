@@ -49,6 +49,26 @@ def _median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
+def _interpolate_efficiency(
+    current: float, points: list[tuple[float, float]]
+) -> float:
+    """Linearly interpolate efficiency from a current-sorted curve.
+
+    Currents outside the curve resolve to the nearest endpoint.
+    """
+    first_current, first_efficiency = points[0]
+    last_current, last_efficiency = points[-1]
+    if current <= first_current:
+        return first_efficiency
+    if current >= last_current:
+        return last_efficiency
+    for (i0, e0), (i1, e1) in zip(points, points[1:]):
+        if current <= i1:
+            ratio = (current - i0) / (i1 - i0)
+            return e0 + ratio * (e1 - e0)
+    return last_efficiency  # pragma: no cover - unreachable for a sorted curve
+
+
 def _interpolate_ocv(voltage: float, points: list[tuple[float, float]]) -> float:
     """Linearly interpolate SoC from a voltage-sorted OCV curve.
 
@@ -557,6 +577,153 @@ class Service:
             "segment_count": segment_count,
             "sample_count": len(samples),
         }
+
+    def estimate_dcdc_efficiency(self, payload: Any) -> dict[str, Any]:
+        """Estimate DC-DC converter losses over a sequence of operating points.
+
+        Efficiency is interpolated linearly from the efficiency curve by
+        output current, clamping to the nearest endpoint outside the
+        curve. Input power adds the quiescent draw on top of the
+        converted power.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        input_voltage = payload.get("input_voltage_v")
+        if not _is_finite_number(input_voltage) or input_voltage <= 0:
+            raise ApiError(
+                422,
+                "invalid_input_voltage",
+                "input_voltage_v must be a positive finite number",
+            )
+
+        quiescent_current = payload.get("quiescent_current_a", 0.0)
+        if not _is_finite_number(quiescent_current) or quiescent_current < 0:
+            raise ApiError(
+                422,
+                "invalid_quiescent_current",
+                "quiescent_current_a must be a non-negative finite number",
+            )
+
+        operating_points = payload.get("operating_points")
+        if not isinstance(operating_points, list) or not operating_points:
+            raise ApiError(
+                422,
+                "invalid_operating_points",
+                "operating_points must be a non-empty array",
+            )
+        for point in operating_points:
+            if not isinstance(point, dict):
+                raise ApiError(
+                    422,
+                    "invalid_operating_points",
+                    "each operating point must be an object",
+                )
+
+        durations: list[float] = []
+        output_voltages: list[float] = []
+        output_currents: list[float] = []
+        for point in operating_points:
+            duration = point.get("duration_s")
+            output_voltage = point.get("output_voltage_v")
+            output_current = point.get("output_current_a")
+            if not _is_finite_number(duration) or duration <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_operating_point",
+                    "duration_s must be a positive finite number",
+                )
+            if not _is_finite_number(output_voltage) or output_voltage <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_operating_point",
+                    "output_voltage_v must be a positive finite number",
+                )
+            if not _is_finite_number(output_current) or output_current < 0:
+                raise ApiError(
+                    422,
+                    "invalid_operating_point",
+                    "output_current_a must be a non-negative finite number",
+                )
+            durations.append(float(duration))
+            output_voltages.append(float(output_voltage))
+            output_currents.append(float(output_current))
+
+        curve_points = self._parse_efficiency_curve(payload.get("efficiency_curve"))
+
+        quiescent_power = float(input_voltage) * float(quiescent_current)
+        estimates: list[dict[str, Any]] = []
+        input_energy_wh = 0.0
+        output_energy_wh = 0.0
+        for index in range(len(operating_points)):
+            output_power = output_voltages[index] * output_currents[index]
+            efficiency = _interpolate_efficiency(output_currents[index], curve_points)
+            input_power = output_power / efficiency + quiescent_power
+            loss_power = input_power - output_power
+            estimates.append(
+                {
+                    "input_power_w": input_power,
+                    "output_power_w": output_power,
+                    "loss_power_w": loss_power,
+                    "efficiency": output_power / input_power if input_power else 0.0,
+                }
+            )
+            hours = durations[index] / 3600.0
+            input_energy_wh += input_power * hours
+            output_energy_wh += output_power * hours
+
+        loss_energy_wh = input_energy_wh - output_energy_wh
+        overall_efficiency = (
+            output_energy_wh / input_energy_wh if input_energy_wh else 0.0
+        )
+        return {
+            "estimates": estimates,
+            "input_energy_wh": input_energy_wh,
+            "output_energy_wh": output_energy_wh,
+            "loss_energy_wh": loss_energy_wh,
+            "overall_efficiency": overall_efficiency,
+        }
+
+    @staticmethod
+    def _parse_efficiency_curve(curve: Any) -> list[tuple[float, float]]:
+        if not isinstance(curve, list) or len(curve) < 2:
+            raise ApiError(
+                422,
+                "invalid_efficiency_curve",
+                "efficiency_curve must contain at least two points",
+            )
+        points: list[tuple[float, float]] = []
+        previous_current: float | None = None
+        for point in curve:
+            if not isinstance(point, dict):
+                raise ApiError(
+                    422,
+                    "invalid_efficiency_curve",
+                    "each efficiency curve point must be an object",
+                )
+            current = point.get("output_current_a")
+            efficiency = point.get("efficiency")
+            if not _is_finite_number(current) or current < 0:
+                raise ApiError(
+                    422,
+                    "invalid_efficiency_curve",
+                    "curve point output_current_a must be a non-negative finite number",
+                )
+            if not _is_finite_number(efficiency) or not 0 < efficiency <= 1:
+                raise ApiError(
+                    422,
+                    "invalid_efficiency_curve",
+                    "curve point efficiency must be a finite number within (0, 1]",
+                )
+            if previous_current is not None and current <= previous_current:
+                raise ApiError(
+                    422,
+                    "invalid_efficiency_curve",
+                    "curve point output_current_a must be strictly increasing",
+                )
+            points.append((float(current), float(efficiency)))
+            previous_current = current
+        return points
 
     @staticmethod
     def _parse_filter_options(
