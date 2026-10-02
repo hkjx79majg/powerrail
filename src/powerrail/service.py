@@ -16,6 +16,9 @@ DEFAULT_REST_CURRENT_A = 0.05
 DEFAULT_REST_DURATION_S = 300.0
 DEFAULT_OCV_WEIGHT = 0.2
 DEFAULT_END_OF_LIFE_SOH = 0.8
+DEFAULT_MEDIAN_WINDOW = 3
+DEFAULT_SMOOTHING_FACTOR = 0.25
+DEFAULT_RESET_GAP_S = 30.0
 
 
 class ApiError(Exception):
@@ -35,6 +38,15 @@ def _is_finite_number(value: Any) -> bool:
         and not isinstance(value, bool)
         and math.isfinite(value)
     )
+
+
+def _median(values: list[float]) -> float:
+    """Median of a non-empty list; even counts average the middle pair."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
 def _interpolate_ocv(voltage: float, points: list[tuple[float, float]]) -> float:
@@ -444,6 +456,142 @@ class Service:
             "unallocated_power_w": unallocated,
             "allocations": allocations,
         }
+
+    def filter_telemetry(self, payload: Any) -> dict[str, Any]:
+        """Denoise current/voltage telemetry with segment-aware median + EMA."""
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ApiError(422, "invalid_samples", "samples must be a non-empty array")
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(422, "invalid_samples", "each sample must be an object")
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(float(timestamp))
+            previous_timestamp = timestamp
+
+        currents: list[float] = []
+        voltages: list[float] = []
+        for sample in samples:
+            current = sample.get("current_a")
+            voltage = sample.get("voltage_v")
+            if not _is_finite_number(current) or not _is_finite_number(voltage):
+                raise ApiError(
+                    422,
+                    "invalid_measurement",
+                    "current_a and voltage_v must be finite numbers",
+                )
+            currents.append(float(current))
+            voltages.append(float(voltage))
+
+        median_window, smoothing_factor, reset_gap_s = self._parse_filter_options(
+            payload
+        )
+
+        filtered_samples: list[dict[str, Any]] = []
+        current_history: list[float] = []
+        voltage_history: list[float] = []
+        previous_current: float | None = None
+        previous_voltage: float | None = None
+        segment_count = 0
+
+        for index in range(len(samples)):
+            segment_start = False
+            if index == 0 or timestamps[index] - timestamps[index - 1] > reset_gap_s:
+                segment_count += 1
+                segment_start = True
+                current_history = []
+                voltage_history = []
+                previous_current = None
+                previous_voltage = None
+
+            current_median = _median(current_history + [currents[index]])
+            voltage_median = _median(voltage_history + [voltages[index]])
+            if previous_current is None:
+                filtered_current = current_median
+                filtered_voltage = voltage_median
+            else:
+                filtered_current = (
+                    smoothing_factor * current_median
+                    + (1.0 - smoothing_factor) * previous_current
+                )
+                filtered_voltage = (
+                    smoothing_factor * voltage_median
+                    + (1.0 - smoothing_factor) * previous_voltage
+                )
+
+            filtered_samples.append(
+                {
+                    "timestamp_s": samples[index]["timestamp_s"],
+                    "filtered_current_a": filtered_current,
+                    "filtered_voltage_v": filtered_voltage,
+                    "segment_start": segment_start,
+                }
+            )
+
+            previous_current = filtered_current
+            previous_voltage = filtered_voltage
+            current_history.append(currents[index])
+            voltage_history.append(voltages[index])
+            max_previous = median_window - 1
+            if len(current_history) > max_previous:
+                current_history = current_history[-max_previous:] if max_previous else []
+                voltage_history = voltage_history[-max_previous:] if max_previous else []
+
+        return {
+            "samples": filtered_samples,
+            "segment_count": segment_count,
+            "sample_count": len(samples),
+        }
+
+    @staticmethod
+    def _parse_filter_options(
+        payload: dict[str, Any],
+    ) -> tuple[int, float, float]:
+        median_window = payload.get("median_window", DEFAULT_MEDIAN_WINDOW)
+        if (
+            not isinstance(median_window, int)
+            or isinstance(median_window, bool)
+            or not 1 <= median_window <= 11
+            or median_window % 2 == 0
+        ):
+            raise ApiError(
+                422,
+                "invalid_filter_options",
+                "median_window must be an odd integer within [1, 11]",
+            )
+
+        smoothing_factor = payload.get("smoothing_factor", DEFAULT_SMOOTHING_FACTOR)
+        if not _is_finite_number(smoothing_factor) or not 0.0 < smoothing_factor <= 1.0:
+            raise ApiError(
+                422,
+                "invalid_filter_options",
+                "smoothing_factor must be a finite number within (0, 1]",
+            )
+
+        reset_gap_s = payload.get("reset_gap_s", DEFAULT_RESET_GAP_S)
+        if not _is_finite_number(reset_gap_s) or reset_gap_s <= 0.0:
+            raise ApiError(
+                422,
+                "invalid_filter_options",
+                "reset_gap_s must be a positive finite number",
+            )
+
+        return median_window, float(smoothing_factor), float(reset_gap_s)
 
     @staticmethod
     def _fund_levels(
