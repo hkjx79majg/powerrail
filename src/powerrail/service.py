@@ -680,6 +680,138 @@ class Service:
             "overall_efficiency": overall_efficiency,
         }
 
+    def protect_thermal(self, payload: Any) -> dict[str, Any]:
+        """Limit charge current from cell temperature with a latching cutoff.
+
+        Below the warning threshold the thermal limit is the configured
+        maximum; between warning and critical it ramps linearly to zero;
+        at or above critical the limit latches at zero until temperature
+        falls to the recovery threshold or lower.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        protection = payload.get("protection")
+        if not isinstance(protection, dict):
+            raise ApiError(
+                422,
+                "invalid_protection_config",
+                "protection must be an object",
+            )
+
+        max_current = protection.get("max_charge_current_a")
+        if not _is_finite_number(max_current) or max_current <= 0:
+            raise ApiError(
+                422,
+                "invalid_protection_config",
+                "max_charge_current_a must be a positive finite number",
+            )
+
+        recovery_temp = protection.get("recovery_temperature_c")
+        warning_temp = protection.get("warning_temperature_c")
+        critical_temp = protection.get("critical_temperature_c")
+        if (
+            not _is_finite_number(recovery_temp)
+            or not _is_finite_number(warning_temp)
+            or not _is_finite_number(critical_temp)
+        ):
+            raise ApiError(
+                422,
+                "invalid_protection_config",
+                "recovery_temperature_c, warning_temperature_c and "
+                "critical_temperature_c must be finite numbers",
+            )
+        if not recovery_temp < warning_temp < critical_temp:
+            raise ApiError(
+                422,
+                "invalid_protection_config",
+                "temperatures must satisfy recovery_temperature_c < "
+                "warning_temperature_c < critical_temperature_c",
+            )
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ApiError(422, "invalid_samples", "samples must be a non-empty array")
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(422, "invalid_samples", "each sample must be an object")
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(float(timestamp))
+            previous_timestamp = timestamp
+
+        temperatures: list[float] = []
+        for sample in samples:
+            temperature = sample.get("temperature_c")
+            if not _is_finite_number(temperature):
+                raise ApiError(
+                    422, "invalid_temperature", "temperature_c must be a finite number"
+                )
+            temperatures.append(float(temperature))
+
+        requested_currents: list[float] = []
+        for sample in samples:
+            requested = sample.get("requested_current_a")
+            if not _is_finite_number(requested) or requested < 0:
+                raise ApiError(
+                    422,
+                    "invalid_current",
+                    "requested_current_a must be a non-negative finite number",
+                )
+            requested_currents.append(float(requested))
+
+        decisions: list[dict[str, Any]] = []
+        latched = False
+        cutoff_count = 0
+        span = critical_temp - warning_temp
+
+        for index in range(len(samples)):
+            temperature = temperatures[index]
+            if latched:
+                if temperature <= recovery_temp:
+                    latched = False
+                else:
+                    thermal_limit = 0.0
+                    state = "cutoff"
+            if not latched:
+                if temperature >= critical_temp:
+                    thermal_limit = 0.0
+                    state = "cutoff"
+                    latched = True
+                    cutoff_count += 1
+                elif temperature >= warning_temp:
+                    thermal_limit = max_current * (critical_temp - temperature) / span
+                    state = "derated"
+                else:
+                    thermal_limit = max_current
+                    state = "normal"
+            allowed = min(requested_currents[index], thermal_limit)
+            decisions.append(
+                {
+                    "timestamp_s": samples[index]["timestamp_s"],
+                    "allowed_current_a": allowed,
+                    "thermal_limit_a": thermal_limit,
+                    "state": state,
+                }
+            )
+
+        return {
+            "decisions": decisions,
+            "final_state": decisions[-1]["state"],
+            "cutoff_count": cutoff_count,
+        }
+
     @staticmethod
     def _parse_efficiency_curve(curve: Any) -> list[tuple[float, float]]:
         if not isinstance(curve, list) or len(curve) < 2:
