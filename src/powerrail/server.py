@@ -7,7 +7,9 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import SocError, Service
+
+SOC_PATH = "/v1/battery/soc/estimate"
 
 
 def env_address() -> tuple[str, int]:
@@ -34,6 +36,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.health())
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def do_POST(self) -> None:
+        if self.path != SOC_PATH:
+            self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                raise ValueError("negative content length")
+            raw = self.rfile.read(length) if length > 0 else b""
+            request = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self.send_json(400, {"error": {"code": "invalid_json", "message": "request body must be valid JSON"}})
+            return
+        if not isinstance(request, dict):
+            self.send_json(400, {"error": {"code": "invalid_json", "message": "request body must be a JSON object"}})
+            return
+        try:
+            result = self.service.estimate_soc(request)
+        except SocError as exc:
+            self.send_json(exc.status, exc.payload())
+            return
+        self.send_json(200, result)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
