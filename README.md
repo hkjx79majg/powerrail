@@ -58,6 +58,23 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；预算字段非法或保留量超限为 `422 invalid_budget`；`loads` 数组或元素类型非法为 `422 invalid_loads`；`id` 缺失、为空或重复为 `422 invalid_load_id`；功率字段非法为 `422 invalid_load_power`；`priority` 缺失、为布尔值、非整数或越界为 `422 invalid_priority`。
 
+## 电流电压遥测过滤
+
+`POST /v1/telemetry/filter`（也可直接调用 `Service.filter_telemetry`）将含尖峰或不等间隔的电流/电压遥测过滤为稳定序列。
+
+请求字段：
+
+- `samples`（必填）：非空数组，每项含严格递增的有限 `timestamp_s`（布尔值不作为数值接受）以及有限数值 `current_a`、`voltage_v`。
+- `median_window`（可选）：`1` 至 `11` 的奇数，默认 `3`。
+- `smoothing_factor`（可选）：`(0, 1]` 内有限数，默认 `0.25`。
+- `reset_gap_s`（可选）：正有限秒数，默认 `30`。
+
+电流与电压两通道独立过滤但共享分段边界：首项开始新段；相邻时间戳之差严格大于 `reset_gap_s` 时当前项另起新段并清空该段全部过滤状态。每段内对当前值与同通道此前至多 `median_window - 1` 个原始值取中位数（偶数个候选取中间两值均值）；分段首项直接采用中位数，其余项输出 `smoothing_factor * 当前中位数 + (1 - smoothing_factor) * 上一过滤值`。
+
+响应 `samples` 与输入等长同序，每项含 `timestamp_s`、`filtered_current_a`、`filtered_voltage_v`、`segment_start`（仅首项及间隔触发重置时为 `true`）；顶层含 `segment_count` 与 `sample_count`。响应保留原始时间戳且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 不是非空数组或元素不是对象为 `422 invalid_samples`；时间戳缺失、非有限、为布尔值或未严格递增为 `422 invalid_timestamp`；电流或电压缺失、非有限或为布尔值为 `422 invalid_measurement`；过滤选项类型或范围不符为 `422 invalid_filter_options`。
+
 ## 验证
 
 ```bash
