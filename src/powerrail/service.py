@@ -297,6 +297,195 @@ class Service:
             "projection_status": projection_status,
         }
 
+    def allocate_power_budget(self, payload: Any) -> dict[str, Any]:
+        """Allocate a power budget across prioritized loads.
+
+        Minimum power is funded first, highest priority level first; a
+        level that cannot be fully funded splits the remainder
+        proportionally to each load's minimum and lower levels get
+        nothing. Leftover power then funds unmet demand the same way.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        available = payload.get("available_power_w")
+        if not _is_finite_number(available) or available < 0:
+            raise ApiError(
+                422,
+                "invalid_budget",
+                "available_power_w must be a non-negative finite number",
+            )
+
+        reserve = payload.get("reserve_power_w", 0.0)
+        if not _is_finite_number(reserve) or reserve < 0:
+            raise ApiError(
+                422,
+                "invalid_budget",
+                "reserve_power_w must be a non-negative finite number",
+            )
+        if reserve > available:
+            raise ApiError(
+                422,
+                "invalid_budget",
+                "reserve_power_w must not exceed available_power_w",
+            )
+
+        loads = payload.get("loads")
+        if not isinstance(loads, list) or not loads:
+            raise ApiError(422, "invalid_loads", "loads must be a non-empty array")
+        for load in loads:
+            if not isinstance(load, dict):
+                raise ApiError(422, "invalid_loads", "each load must be an object")
+
+        ids: list[str] = []
+        demands: list[float] = []
+        minimums: list[float] = []
+        priorities: list[int] = []
+        seen_ids: set[str] = set()
+        for load in loads:
+            load_id = load.get("id")
+            if not isinstance(load_id, str) or not load_id:
+                raise ApiError(
+                    422, "invalid_load_id", "each load id must be a non-empty string"
+                )
+            if load_id in seen_ids:
+                raise ApiError(
+                    422, "invalid_load_id", f"load id {load_id!r} is duplicated"
+                )
+            seen_ids.add(load_id)
+            ids.append(load_id)
+
+            demand = load.get("demand_power_w")
+            minimum = load.get("min_power_w")
+            if not _is_finite_number(demand) or demand < 0:
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "demand_power_w must be a non-negative finite number",
+                )
+            if not _is_finite_number(minimum) or minimum < 0:
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "min_power_w must be a non-negative finite number",
+                )
+            if minimum > demand:
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "min_power_w must not exceed demand_power_w",
+                )
+            demands.append(float(demand))
+            minimums.append(float(minimum))
+
+            priority = load.get("priority")
+            if (
+                not isinstance(priority, int)
+                or isinstance(priority, bool)
+                or not 0 <= priority <= 100
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_priority",
+                    "priority must be an integer within [0, 100]",
+                )
+            priorities.append(priority)
+
+        distributable = available - reserve
+        allocated = [0.0] * len(loads)
+        remaining = self._fund_levels(minimums, priorities, ids, allocated, distributable)
+        remaining = self._fund_levels(demands, priorities, ids, allocated, remaining)
+
+        # Keep floating-point drift inside the documented invariants.
+        for index in range(len(loads)):
+            if allocated[index] < 0.0:
+                allocated[index] = 0.0
+            elif allocated[index] > demands[index]:
+                allocated[index] = demands[index]
+        excess = sum(allocated) - distributable
+        if excess > 0.0:
+            for index in sorted(range(len(loads)), key=lambda i: (-allocated[i], ids[i])):
+                if excess <= 0.0:
+                    break
+                cut = min(allocated[index], excess)
+                allocated[index] -= cut
+                excess -= cut
+        total_allocated = sum(allocated)
+        unallocated = distributable - total_allocated
+        if unallocated < 0.0:
+            unallocated = 0.0
+
+        allocations: list[dict[str, Any]] = []
+        satisfied = True
+        for index in range(len(loads)):
+            shortfall = demands[index] - allocated[index]
+            if shortfall < 0.0:
+                shortfall = 0.0
+            if demands[index] == 0.0 or allocated[index] >= demands[index]:
+                state = "powered"
+            elif allocated[index] > 0.0:
+                state = "limited"
+                satisfied = False
+            else:
+                state = "shed"
+                satisfied = False
+            allocations.append(
+                {
+                    "id": ids[index],
+                    "allocated_power_w": allocated[index],
+                    "shortfall_power_w": shortfall,
+                    "state": state,
+                }
+            )
+
+        return {
+            "status": "satisfied" if satisfied else "constrained",
+            "allocated_power_w": total_allocated,
+            "unallocated_power_w": unallocated,
+            "allocations": allocations,
+        }
+
+    @staticmethod
+    def _fund_levels(
+        targets: list[float],
+        priorities: list[int],
+        ids: list[str],
+        allocated: list[float],
+        remaining: float,
+    ) -> float:
+        """Fund loads toward ``targets`` by descending priority level.
+
+        Fully funds each level while the remaining power covers the
+        level's unmet need; otherwise splits the remainder across the
+        level proportionally to unmet need and returns zero. Members are
+        visited in id order so results do not depend on input ordering.
+        """
+        by_priority: dict[int, list[int]] = {}
+        for index, priority in enumerate(priorities):
+            by_priority.setdefault(priority, []).append(index)
+        for priority in sorted(by_priority, reverse=True):
+            if remaining <= 0.0:
+                break
+            members = [
+                index
+                for index in sorted(by_priority[priority], key=lambda i: ids[i])
+                if targets[index] > allocated[index]
+            ]
+            if not members:
+                continue
+            needs = [targets[index] - allocated[index] for index in members]
+            level_total = sum(needs)
+            if level_total <= remaining:
+                for index in members:
+                    allocated[index] = targets[index]
+                remaining -= level_total
+            else:
+                for index, need in zip(members, needs):
+                    allocated[index] += remaining * need / level_total
+                remaining = 0.0
+                break
+        return remaining
+
     @staticmethod
     def _parse_ocv_curve(
         curve: Any,
