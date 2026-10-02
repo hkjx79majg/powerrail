@@ -7,7 +7,9 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import ApiError, Service
+
+SOC_ROUTE = "/v1/battery/soc/estimate"
 
 
 def env_address() -> tuple[str, int]:
@@ -34,6 +36,31 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.health())
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def do_POST(self) -> None:
+        if self.path != SOC_ROUTE:
+            self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_json(
+                400, {"error": {"code": "invalid_json", "message": "request body must be valid JSON"}}
+            )
+            return
+        try:
+            result = self.service.estimate_soc(payload)
+        except ApiError as exc:
+            self.send_json(
+                exc.status, {"error": {"code": exc.code, "message": exc.message}}
+            )
+            return
+        self.send_json(200, result)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
