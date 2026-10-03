@@ -108,6 +108,23 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 不是非空数组或元素不是对象为 `422 invalid_samples`；时间戳缺失、非有限、为布尔值或未严格递增为 `422 invalid_timestamp`；`current_a`/`voltage_v` 缺失、非有限或为布尔值为 `422 invalid_measurement`；过滤选项类型或范围不符为 `422 invalid_filter_options`。
 
+## 遥测能耗聚合
+
+`POST /v1/telemetry/aggregate`（也可直接调用 `Service.aggregate_telemetry`）把电流/电压遥测按固定时长窗口聚合成充放电能量，并对窗口平均功率做最小二乘趋势估计。正电流表示放电，负电流表示充电。
+
+请求字段：
+
+- `samples`（必填）：至少两项的数组，每项为对象，含严格递增的有限 `timestamp_s` 以及有限数值 `current_a`、`voltage_v`。
+- `bucket_duration_s`（必填）：正有限数窗口时长（秒）。
+- `max_gap_s`（必填）：正有限数最大允许采样间隔（秒）。
+- `trend_threshold_w_per_hour`（可选）：非负有限数趋势阈值，默认 `0`。
+
+从首项时间戳起按 `bucket_duration_s` 划分左闭右开窗口，截止末项时间戳。相邻样本的功率 `current_a * voltage_v` 按线性变化；相邻间隔严格大于 `max_gap_s` 时整段跳过并计入 `skipped_gap_count`（恰好等于不跳过），否则在窗口边界与功率零点处分段做梯形积分。正功率计入放电能量，负功率绝对值计入充电能量，净能量为两者之差。
+
+响应 `buckets` 仅包含有覆盖时长的窗口，每项含 `bucket_start_s`、`bucket_end_s`（末窗口截止末项时间戳）、`covered_duration_s`、`average_power_w`（净能量与覆盖时长折算）、`discharge_energy_wh`、`charge_energy_wh`、`net_energy_wh`；顶层含三种能量总计、`skipped_gap_count`、`trend_slope_w_per_hour` 与 `trend_status`。趋势以窗口中点的小时数与 `average_power_w` 做普通最小二乘：少于两个窗口时斜率为 `null`、状态为 `insufficient`；否则斜率严格高于阈值为 `increasing`，严格低于负阈值为 `decreasing`，其余为 `stable`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 数量或成员结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；`current_a`/`voltage_v` 非法为 `422 invalid_measurement`；`bucket_duration_s`、`max_gap_s` 或 `trend_threshold_w_per_hour` 缺失、为布尔值、非有限或越界为 `422 invalid_options`。
+
 ## 充电热保护
 
 `POST /v1/battery/thermal/protect`（也可直接调用 `Service.protect_thermal`）按电芯温度与期望充电电流生成限流决定。
