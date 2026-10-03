@@ -15,6 +15,7 @@ POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
 DCDC_EFFICIENCY_ROUTE = "/v1/power/dcdc/efficiency/estimate"
 LDO_EFFICIENCY_ROUTE = "/v1/power/ldo/efficiency/estimate"
 TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
+TELEMETRY_AGGREGATE_ROUTE = "/v1/telemetry/aggregate"
 THERMAL_PROTECT_ROUTE = "/v1/battery/thermal/protect"
 BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
 PARALLEL_DISPATCH_ROUTE = "/v1/battery/packs/parallel/dispatch"
@@ -56,6 +57,7 @@ class Handler(BaseHTTPRequestHandler):
             DCDC_EFFICIENCY_ROUTE,
             LDO_EFFICIENCY_ROUTE,
             TELEMETRY_FILTER_ROUTE,
+            TELEMETRY_AGGREGATE_ROUTE,
             THERMAL_PROTECT_ROUTE,
             BALANCE_PLAN_ROUTE,
             PARALLEL_DISPATCH_ROUTE,
@@ -100,6 +102,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.negotiate_wireless_charging(payload)
             elif self.path == ENERGY_BENCHMARK_COMPARE_ROUTE:
                 result = self.service.compare_energy_benchmark(payload)
+            elif self.path == TELEMETRY_AGGREGATE_ROUTE:
+                result = self.service.aggregate_telemetry(payload)
             else:
                 result = self.service.filter_telemetry(payload)
         except ApiError as exc:

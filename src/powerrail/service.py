@@ -20,6 +20,7 @@ DEFAULT_MEDIAN_WINDOW = 3
 DEFAULT_SMOOTHING_FACTOR = 0.25
 DEFAULT_RESET_GAP_S = 30.0
 DEFAULT_REGRESSION_THRESHOLD_PERCENT = 5.0
+DEFAULT_TREND_THRESHOLD_W_PER_HOUR = 0.0
 
 
 class ApiError(Exception):
@@ -598,6 +599,209 @@ class Service:
             "segment_count": segment_count,
             "sample_count": len(samples),
         }
+
+    def aggregate_telemetry(self, payload: Any) -> dict[str, Any]:
+        """Aggregate telemetry into fixed energy buckets and fit a power trend.
+
+        Sample power ``current_a * voltage_v`` is assumed to vary linearly
+        between adjacent samples. Gaps longer than ``max_gap_s`` are skipped
+        wholesale; remaining intervals are split at bucket boundaries and
+        power zero crossings before trapezoidal integration, so positive and
+        negative energy never cancel inside an integral.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or len(samples) < 2:
+            raise ApiError(
+                422,
+                "invalid_samples",
+                "samples must be an array with at least two items",
+            )
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(422, "invalid_samples", "each sample must be an object")
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(float(timestamp))
+            previous_timestamp = timestamp
+
+        powers: list[float] = []
+        for sample in samples:
+            current = sample.get("current_a")
+            voltage = sample.get("voltage_v")
+            if not _is_finite_number(current) or not _is_finite_number(voltage):
+                raise ApiError(
+                    422,
+                    "invalid_measurement",
+                    "current_a and voltage_v must be finite numbers",
+                )
+            powers.append(float(current) * float(voltage))
+
+        bucket_duration, max_gap, trend_threshold = self._parse_aggregate_options(
+            payload
+        )
+
+        origin = timestamps[0]
+        finish = timestamps[-1]
+        first_index = 0
+        last_index = math.floor((finish - origin) / bucket_duration)
+        covered = [0.0] * (last_index + 1)
+        discharge = [0.0] * (last_index + 1)
+        charge = [0.0] * (last_index + 1)
+        skipped_gap_count = 0
+
+        for index in range(1, len(timestamps)):
+            t0 = timestamps[index - 1]
+            t1 = timestamps[index]
+            if t1 - t0 > max_gap:
+                skipped_gap_count += 1
+                continue
+            p0 = powers[index - 1]
+            p1 = powers[index]
+
+            # Every split point inside the open interval: bucket boundaries
+            # and the power zero crossing. Trapezoids between consecutive
+            # split points then carry a single constant power sign.
+            splits = {t0, t1}
+            start_boundary = math.floor((t0 - origin) / bucket_duration) + 1
+            end_boundary = math.floor((t1 - origin) / bucket_duration)
+            if origin + end_boundary * bucket_duration >= t1:
+                end_boundary -= 1
+            for boundary in range(start_boundary, end_boundary + 1):
+                boundary_time = origin + boundary * bucket_duration
+                if t0 < boundary_time < t1:
+                    splits.add(boundary_time)
+            if p0 * p1 < 0.0:
+                zero_time = t0 + (t1 - t0) * (-p0) / (p1 - p0)
+                if t0 < zero_time < t1:
+                    splits.add(zero_time)
+
+            for segment_start, segment_end in zip(sorted(splits), sorted(splits)[1:]):
+                ratio0 = (segment_start - t0) / (t1 - t0)
+                ratio1 = (segment_end - t0) / (t1 - t0)
+                power_start = p0 + (p1 - p0) * ratio0
+                power_end = p0 + (p1 - p0) * ratio1
+                energy = (
+                    (power_start + power_end)
+                    / 2.0
+                    * (segment_end - segment_start)
+                    / 3600.0
+                )
+                bucket_index = math.floor((segment_start - origin) / bucket_duration)
+                if first_index <= bucket_index <= last_index:
+                    covered[bucket_index] += segment_end - segment_start
+                    if energy >= 0.0:
+                        discharge[bucket_index] += energy
+                    else:
+                        charge[bucket_index] += -energy
+
+        buckets: list[dict[str, Any]] = []
+        total_discharge = 0.0
+        total_charge = 0.0
+        for index in range(first_index, last_index + 1):
+            if covered[index] <= 0.0:
+                continue
+            net = discharge[index] - charge[index]
+            bucket = {
+                "start_time_s": origin + index * bucket_duration,
+                "end_time_s": origin + (index + 1) * bucket_duration,
+                "covered_duration_s": covered[index],
+                "average_power_w": net * 3600.0 / covered[index],
+                "discharge_energy_wh": discharge[index],
+                "charge_energy_wh": charge[index],
+                "net_energy_wh": net,
+            }
+            buckets.append(bucket)
+            total_discharge += discharge[index]
+            total_charge += charge[index]
+
+        midpoints_hours = [
+            (bucket["start_time_s"] + bucket["end_time_s"]) / 2.0 - origin
+            for bucket in buckets
+        ]
+        midpoints_hours = [value / 3600.0 for value in midpoints_hours]
+        average_powers = [bucket["average_power_w"] for bucket in buckets]
+        trend_slope: float | None
+        if len(buckets) < 2:
+            trend_slope = None
+            trend_status = "insufficient"
+        else:
+            mean_x = sum(midpoints_hours) / len(midpoints_hours)
+            mean_y = sum(average_powers) / len(average_powers)
+            denominator = sum(
+                (x - mean_x) ** 2 for x in midpoints_hours
+            )
+            if denominator == 0.0:
+                trend_slope = 0.0
+            else:
+                trend_slope = (
+                    sum(
+                        (x - mean_x) * (y - mean_y)
+                        for x, y in zip(midpoints_hours, average_powers)
+                    )
+                    / denominator
+                )
+            if trend_slope > trend_threshold:
+                trend_status = "increasing"
+            elif trend_slope < -trend_threshold:
+                trend_status = "decreasing"
+            else:
+                trend_status = "stable"
+
+        return {
+            "buckets": buckets,
+            "discharge_energy_wh": total_discharge,
+            "charge_energy_wh": total_charge,
+            "net_energy_wh": total_discharge - total_charge,
+            "skipped_gap_count": skipped_gap_count,
+            "trend_slope_w_per_hour": trend_slope,
+            "trend_status": trend_status,
+        }
+
+    @staticmethod
+    def _parse_aggregate_options(
+        payload: dict[str, Any],
+    ) -> tuple[float, float, float]:
+        bucket_duration = payload.get("bucket_duration_s")
+        if not _is_finite_number(bucket_duration) or bucket_duration <= 0.0:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "bucket_duration_s must be a positive finite number",
+            )
+
+        max_gap = payload.get("max_gap_s")
+        if not _is_finite_number(max_gap) or max_gap <= 0.0:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "max_gap_s must be a positive finite number",
+            )
+
+        trend_threshold = payload.get(
+            "trend_threshold_w_per_hour", DEFAULT_TREND_THRESHOLD_W_PER_HOUR
+        )
+        if not _is_finite_number(trend_threshold) or trend_threshold < 0.0:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "trend_threshold_w_per_hour must be a non-negative finite number",
+            )
+
+        return float(bucket_duration), float(max_gap), float(trend_threshold)
 
     def estimate_dcdc_efficiency(self, payload: Any) -> dict[str, Any]:
         """Estimate per-operating-point DC-DC efficiency and energy totals."""
