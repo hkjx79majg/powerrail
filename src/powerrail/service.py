@@ -818,6 +818,227 @@ class Service:
             "cutoff_count": cutoff_count,
         }
 
+    def plan_balance(self, payload: Any) -> dict[str, Any]:
+        """Plan passive cell balancing with hysteresis and channel limits.
+
+        Cells below the maximum temperature become candidates when a
+        previously inactive cell reaches ``start_delta_v`` or a
+        previously active cell stays strictly above ``stop_delta_v``;
+        cells at or above the maximum temperature never balance. Up to
+        ``max_channels`` candidates are activated by descending delta
+        and ascending id.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        cells = payload.get("cells")
+        if not isinstance(cells, list) or not cells:
+            raise ApiError(422, "invalid_cells", "cells must be a non-empty array")
+        for cell in cells:
+            if not isinstance(cell, dict):
+                raise ApiError(422, "invalid_cells", "each cell must be an object")
+
+        ids: list[str] = []
+        voltages: list[float] = []
+        temperatures: list[float] = []
+        seen_ids: set[str] = set()
+        for cell in cells:
+            cell_id = cell.get("id")
+            if not isinstance(cell_id, str) or not cell_id:
+                raise ApiError(
+                    422, "invalid_cell_id", "each cell id must be a non-empty string"
+                )
+            if cell_id in seen_ids:
+                raise ApiError(
+                    422, "invalid_cell_id", f"cell id {cell_id!r} is duplicated"
+                )
+            seen_ids.add(cell_id)
+            ids.append(cell_id)
+
+            voltage = cell.get("voltage_v")
+            if not _is_finite_number(voltage) or voltage <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_cell_voltage",
+                    "voltage_v must be a positive finite number",
+                )
+            voltages.append(float(voltage))
+
+            temperature = cell.get("temperature_c")
+            if not _is_finite_number(temperature):
+                raise ApiError(
+                    422,
+                    "invalid_cell_temperature",
+                    "temperature_c must be a finite number",
+                )
+            temperatures.append(float(temperature))
+
+        (
+            start_delta,
+            bleed_current,
+            stop_delta,
+            max_temperature,
+            max_channels,
+        ) = self._parse_balance_config(payload.get("config"), len(cells))
+
+        if "previous_active_ids" in payload:
+            previous_active = self._parse_previous_active_ids(
+                payload["previous_active_ids"], ids
+            )
+        else:
+            previous_active = set()
+
+        target_voltage = min(voltages)
+        deltas = [voltage - target_voltage for voltage in voltages]
+
+        candidate_indexes: list[int] = []
+        blocked = [False] * len(cells)
+        eligible = [False] * len(cells)
+        for index in range(len(cells)):
+            if temperatures[index] >= max_temperature:
+                blocked[index] = True
+            elif ids[index] in previous_active:
+                if deltas[index] > stop_delta:
+                    eligible[index] = True
+                    candidate_indexes.append(index)
+            elif deltas[index] >= start_delta:
+                eligible[index] = True
+                candidate_indexes.append(index)
+
+        candidate_indexes.sort(key=lambda i: (-deltas[i], ids[i]))
+        chosen_indexes = candidate_indexes[:max_channels]
+        selected = set(chosen_indexes)
+        active_ids = [ids[index] for index in chosen_indexes]
+
+        decisions: list[dict[str, Any]] = []
+        for index in range(len(cells)):
+            if blocked[index]:
+                active = False
+                assigned_current = 0.0
+                reason = "temperature_blocked"
+            elif index in selected:
+                active = True
+                assigned_current = bleed_current
+                reason = "selected"
+            elif eligible[index]:
+                active = False
+                assigned_current = 0.0
+                reason = "channel_limited"
+            else:
+                active = False
+                assigned_current = 0.0
+                reason = "below_threshold"
+            decisions.append(
+                {
+                    "id": ids[index],
+                    "delta_voltage_v": deltas[index],
+                    "active": active,
+                    "bleed_current_a": assigned_current,
+                    "reason": reason,
+                }
+            )
+
+        return {
+            "target_voltage_v": target_voltage,
+            "decisions": decisions,
+            "active_ids": active_ids,
+            "status": "balancing" if active_ids else "idle",
+        }
+
+    @staticmethod
+    def _parse_balance_config(
+        config: Any, cell_count: int
+    ) -> tuple[float, float, float, float, int]:
+        if not isinstance(config, dict):
+            raise ApiError(422, "invalid_balance_config", "config must be an object")
+
+        start_delta = config.get("start_delta_v")
+        if not _is_finite_number(start_delta) or start_delta <= 0:
+            raise ApiError(
+                422,
+                "invalid_balance_config",
+                "start_delta_v must be a positive finite number",
+            )
+
+        bleed_current = config.get("bleed_current_a")
+        if not _is_finite_number(bleed_current) or bleed_current <= 0:
+            raise ApiError(
+                422,
+                "invalid_balance_config",
+                "bleed_current_a must be a positive finite number",
+            )
+
+        stop_delta = config.get("stop_delta_v")
+        if (
+            not _is_finite_number(stop_delta)
+            or not 0 <= stop_delta < start_delta
+        ):
+            raise ApiError(
+                422,
+                "invalid_balance_config",
+                "stop_delta_v must be a finite number within [0, start_delta_v)",
+            )
+
+        max_temperature = config.get("max_temperature_c")
+        if not _is_finite_number(max_temperature):
+            raise ApiError(
+                422,
+                "invalid_balance_config",
+                "max_temperature_c must be a finite number",
+            )
+
+        max_channels = config.get("max_channels")
+        if (
+            not isinstance(max_channels, int)
+            or isinstance(max_channels, bool)
+            or not 1 <= max_channels <= cell_count
+        ):
+            raise ApiError(
+                422,
+                "invalid_balance_config",
+                "max_channels must be a positive integer not exceeding the cell count",
+            )
+
+        return (
+            float(start_delta),
+            float(bleed_current),
+            float(stop_delta),
+            float(max_temperature),
+            max_channels,
+        )
+
+    @staticmethod
+    def _parse_previous_active_ids(raw: Any, ids: list[str]) -> set[str]:
+        if not isinstance(raw, list):
+            raise ApiError(
+                422,
+                "invalid_previous_active_ids",
+                "previous_active_ids must be an array of cell ids",
+            )
+        known_ids = set(ids)
+        previous_active: set[str] = set()
+        for cell_id in raw:
+            if not isinstance(cell_id, str) or not cell_id:
+                raise ApiError(
+                    422,
+                    "invalid_previous_active_ids",
+                    "previous_active_ids items must be non-empty cell ids",
+                )
+            if cell_id in previous_active:
+                raise ApiError(
+                    422,
+                    "invalid_previous_active_ids",
+                    f"previous cell id {cell_id!r} is duplicated",
+                )
+            if cell_id not in known_ids:
+                raise ApiError(
+                    422,
+                    "invalid_previous_active_ids",
+                    f"previous cell id {cell_id!r} is unknown",
+                )
+            previous_active.add(cell_id)
+        return previous_active
+
     @staticmethod
     def _parse_efficiency_curve(curve: Any) -> list[tuple[float, float]]:
         if not isinstance(curve, list) or len(curve) < 2:

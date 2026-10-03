@@ -107,6 +107,22 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`protection` 结构、数值或阈值顺序非法为 `422 invalid_protection_config`；`samples` 结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；温度非法为 `422 invalid_temperature`；期望电流非法为 `422 invalid_current`。
 
+## 电芯均衡计划
+
+`POST /v1/battery/balance/plan`（也可直接调用 `Service.plan_balance`）依据各电芯电压、温度与上一轮激活状态生成本轮被动均衡决定。
+
+请求字段：
+
+- `cells`（必填）：非空数组，每项含唯一非空字符串 `id`、正有限数 `voltage_v` 和有限数 `temperature_c`。
+- `config`（必填）：对象，含正有限数 `start_delta_v` 与 `bleed_current_a`、满足 `0 <= stop_delta_v < start_delta_v` 的有限数 `stop_delta_v`、有限数 `max_temperature_c`，以及不超过电芯数的正整数 `max_channels`。
+- `previous_active_ids`（可选）：无重复且都存在于 `cells` 的 id 数组，省略视为空。
+
+以最低电芯电压为 `target_voltage_v`，各电芯压差为自身电压减该值。温度达到 `max_temperature_c`（含相等）时禁止均衡；温度低于上限时，原未激活电芯压差达到（含等于）`start_delta_v` 即成为候选，原激活电芯压差严格大于 `stop_delta_v` 即可继续。候选按压差降序、`id` 升序排序，取前 `max_channels` 个激活。
+
+响应 `decisions` 与输入等长同序，每项含 `id`、`delta_voltage_v`、`active`、`bleed_current_a`（选中项为配置电流，其余为 `0`）和 `reason`（`selected`、`below_threshold`、`temperature_blocked` 或 `channel_limited`）；顶层含 `target_voltage_v`、按上述排序得到的 `active_ids` 和 `status`（有选中项为 `balancing`，否则为 `idle`）。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`cells` 结构非法为 `422 invalid_cells`；`id` 缺失、为空或重复为 `422 invalid_cell_id`；电压、温度非法分别为 `422 invalid_cell_voltage`、`422 invalid_cell_temperature`；`config` 缺失或非法为 `422 invalid_balance_config`；`previous_active_ids` 类型错误、重复或引用未知 id 为 `422 invalid_previous_active_ids`。
+
 ## 验证
 
 ```bash

@@ -15,6 +15,7 @@ POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
 DCDC_EFFICIENCY_ROUTE = "/v1/power/dcdc/efficiency/estimate"
 TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
 THERMAL_PROTECT_ROUTE = "/v1/battery/thermal/protect"
+BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
 
 
 def env_address() -> tuple[str, int]:
@@ -50,6 +51,7 @@ class Handler(BaseHTTPRequestHandler):
             DCDC_EFFICIENCY_ROUTE,
             TELEMETRY_FILTER_ROUTE,
             THERMAL_PROTECT_ROUTE,
+            BALANCE_PLAN_ROUTE,
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
@@ -76,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.estimate_dcdc_efficiency(payload)
             elif self.path == THERMAL_PROTECT_ROUTE:
                 result = self.service.protect_thermal(payload)
+            elif self.path == BALANCE_PLAN_ROUTE:
+                result = self.service.plan_balance(payload)
             else:
                 result = self.service.filter_telemetry(payload)
         except ApiError as exc:
