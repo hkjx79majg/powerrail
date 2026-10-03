@@ -1224,6 +1224,161 @@ class Service:
             "trend_status": trend_status,
         }
 
+    def analyze_telemetry_trend(self, payload: Any) -> dict[str, Any]:
+        """Score aggregated power windows against a rolling median baseline.
+
+        A window is valid only when it carries coverage and its coverage
+        ratio reaches ``min_coverage_ratio``. Each valid window is scored
+        against the median of the previous ``baseline_window`` valid
+        powers (an even count averages the middle pair); windows seen
+        while that history is short target ``warming_up`` and stay at
+        ``normal``. Reaching the critical or warning deviation targets
+        the matching level; escalation is immediate, while de-escalation
+        needs ``recovery_windows`` consecutive valid windows targeting a
+        lower level to drop a single level. Invalid windows target
+        ``insufficient``, report no baseline or deviation, hold the
+        level, reset the recovery streak and never enter the history.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        buckets = payload.get("buckets")
+        if not isinstance(buckets, list) or not buckets:
+            raise ApiError(
+                422, "invalid_buckets", "buckets must be a non-empty array"
+            )
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                raise ApiError(422, "invalid_buckets", "each bucket must be an object")
+
+        starts: list[float] = []
+        ends: list[float] = []
+        covereds: list[float] = []
+        powers: list[float] = []
+        previous_start: float | None = None
+        previous_end: float | None = None
+        for bucket in buckets:
+            start = bucket.get("bucket_start_s")
+            end = bucket.get("bucket_end_s")
+            covered = bucket.get("covered_duration_s")
+            power = bucket.get("average_power_w")
+            if (
+                not _is_finite_number(start)
+                or not _is_finite_number(end)
+                or not _is_finite_number(covered)
+                or not _is_finite_number(power)
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_buckets",
+                    "bucket_start_s, bucket_end_s, covered_duration_s and "
+                    "average_power_w must be finite numbers",
+                )
+            start = float(start)
+            end = float(end)
+            covered = float(covered)
+            if start >= end:
+                raise ApiError(
+                    422,
+                    "invalid_buckets",
+                    "bucket_start_s must be strictly less than bucket_end_s",
+                )
+            if previous_start is not None and start <= previous_start:
+                raise ApiError(
+                    422,
+                    "invalid_buckets",
+                    "bucket_start_s must be strictly increasing",
+                )
+            if previous_end is not None and start < previous_end:
+                raise ApiError(
+                    422,
+                    "invalid_buckets",
+                    "buckets must not overlap",
+                )
+            if covered < 0.0 or covered > end - start:
+                raise ApiError(
+                    422,
+                    "invalid_buckets",
+                    "covered_duration_s must lie within zero and the window "
+                    "duration",
+                )
+            starts.append(start)
+            ends.append(end)
+            covereds.append(covered)
+            powers.append(float(power))
+            previous_start = start
+            previous_end = end
+
+        (
+            baseline_window,
+            recovery_windows,
+            min_coverage_ratio,
+            warning_deviation,
+            critical_deviation,
+        ) = self._parse_trend_config(payload.get("config"))
+
+        level_names = self.LOAD_SHED_LEVELS
+        level = 0
+        recovery_streak = 0
+        history: list[float] = []
+
+        results: list[dict[str, Any]] = []
+        for index in range(len(buckets)):
+            window_duration = ends[index] - starts[index]
+            coverage_ratio = covereds[index] / window_duration
+            valid = (
+                covereds[index] > 0.0
+                and coverage_ratio >= min_coverage_ratio
+            )
+
+            baseline: float | None = None
+            deviation: float | None = None
+            if not valid:
+                target_name = "insufficient"
+                recovery_streak = 0
+            elif len(history) < baseline_window:
+                target_name = "warming_up"
+                recovery_streak = 0
+                history.append(powers[index])
+            else:
+                baseline = _median(history[-baseline_window:])
+                deviation = powers[index] - baseline
+                if deviation >= critical_deviation:
+                    target = 2
+                elif deviation >= warning_deviation:
+                    target = 1
+                else:
+                    target = 0
+                target_name = level_names[target]
+                if target > level:
+                    level = target
+                    recovery_streak = 0
+                elif target < level:
+                    recovery_streak += 1
+                    if recovery_streak >= recovery_windows:
+                        level -= 1
+                        recovery_streak = 0
+                else:
+                    recovery_streak = 0
+                history.append(powers[index])
+
+            results.append(
+                {
+                    "bucket_start_s": starts[index],
+                    "bucket_end_s": ends[index],
+                    "covered_duration_s": covereds[index],
+                    "coverage_ratio": coverage_ratio,
+                    "average_power_w": powers[index],
+                    "baseline_power_w": baseline,
+                    "deviation_w": deviation,
+                    "target_level": target_name,
+                    "level": level_names[level],
+                }
+            )
+
+        return {"results": results, "final_level": level_names[level]}
+
+
     def estimate_dcdc_efficiency(self, payload: Any) -> dict[str, Any]:
         """Estimate per-operating-point DC-DC efficiency and energy totals."""
         if not isinstance(payload, dict):
@@ -2989,6 +3144,72 @@ class Service:
             )
 
         return float(bucket_duration), float(max_gap), float(trend_threshold)
+
+    @staticmethod
+    def _parse_trend_config(
+        config: Any,
+    ) -> tuple[int, int, float, float, float]:
+        if not isinstance(config, dict):
+            raise ApiError(
+                422, "invalid_trend_config", "config must be an object"
+            )
+
+        baseline_window = config.get("baseline_window")
+        if (
+            not isinstance(baseline_window, int)
+            or isinstance(baseline_window, bool)
+            or baseline_window < 1
+        ):
+            raise ApiError(
+                422,
+                "invalid_trend_config",
+                "baseline_window must be a positive integer",
+            )
+
+        recovery_windows = config.get("recovery_windows")
+        if (
+            not isinstance(recovery_windows, int)
+            or isinstance(recovery_windows, bool)
+            or recovery_windows < 1
+        ):
+            raise ApiError(
+                422,
+                "invalid_trend_config",
+                "recovery_windows must be a positive integer",
+            )
+
+        min_coverage_ratio = config.get("min_coverage_ratio")
+        if (
+            not _is_finite_number(min_coverage_ratio)
+            or not 0.0 <= min_coverage_ratio <= 1.0
+        ):
+            raise ApiError(
+                422,
+                "invalid_trend_config",
+                "min_coverage_ratio must be a finite number within [0, 1]",
+            )
+
+        warning_deviation = config.get("warning_deviation_w")
+        critical_deviation = config.get("critical_deviation_w")
+        if (
+            not _is_finite_number(warning_deviation)
+            or not _is_finite_number(critical_deviation)
+            or not 0.0 <= warning_deviation < critical_deviation
+        ):
+            raise ApiError(
+                422,
+                "invalid_trend_config",
+                "thresholds must satisfy 0 <= warning_deviation_w < "
+                "critical_deviation_w",
+            )
+
+        return (
+            baseline_window,
+            recovery_windows,
+            float(min_coverage_ratio),
+            float(warning_deviation),
+            float(critical_deviation),
+        )
 
     @staticmethod
     def _fund_levels(
