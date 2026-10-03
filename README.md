@@ -169,6 +169,19 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`config` 结构、功率上限或温度阈值非法为 `422 invalid_wireless_config`；`profiles` 结构或档位字段非法为 `422 invalid_profiles`；`samples` 结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；样本字段非法为 `422 invalid_wireless_sample`。
 
+## 能耗基准比较
+
+`POST /v1/energy/benchmark/compare`（也可直接调用 `Service.compare_energy_benchmark`）按场景把历史基准运行与当前运行折算成功率后比较。
+
+请求字段：
+
+- `scenarios`（必填）：非空数组，每项为对象，含唯一非空字符串 `id`、非空 `baseline_runs` 和非空 `current_runs`；每次运行为对象，含非负有限数 `energy_wh` 和正有限数 `duration_s`。
+- `regression_threshold_percent`（可选）：非负有限数，默认 `5`。
+
+单次运行功率为 `energy_wh * 3600 / duration_s`，每组取算术平均。响应 `results` 与输入同序，每项含 `id`、`baseline_power_w`、`current_power_w`、`delta_power_w`（当前减基准）、`change_percent` 和 `status`。基准功率大于零时 `change_percent` 为功率差相对基准的百分比；两组均为零时取 `0`；仅基准为零时取 `null`。上下边界分别为基准功率乘以 `1 + 阈值/100` 与 `1 - 阈值/100`：当前功率严格高于上界为 `regression`，严格低于下界为 `improvement`，否则为 `stable`；仅基准为零而当前大于零时直接判为 `regression`。顶层返回 `regression_count`、`improvement_count` 和 `overall_status`，总体判定退化优先，其次为改善，否则为稳定。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`scenarios` 缺失、为空、非数组或成员非对象为 `422 invalid_scenarios`；`id` 非法或重复为 `422 invalid_scenario_id`；运行集合缺失、为空、非数组或含非对象为 `422 invalid_runs`；运行数值缺失、为布尔值、非有限或超出范围为 `422 invalid_run_measurement`；阈值非法为 `422 invalid_options`。
+
 ## 验证
 
 ```bash
