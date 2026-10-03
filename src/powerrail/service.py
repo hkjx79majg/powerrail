@@ -814,6 +814,185 @@ class Service:
             "overall_efficiency": overall_efficiency,
         }
 
+    def estimate_solar_harvest(self, payload: Any) -> dict[str, Any]:
+        """Estimate solar harvester throughput and energy from panel samples."""
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or len(samples) < 2:
+            raise ApiError(
+                422,
+                "invalid_samples",
+                "samples must be an array with at least two items",
+            )
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(422, "invalid_samples", "each sample must be an object")
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_samples", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_samples", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(float(timestamp))
+            previous_timestamp = timestamp
+
+        readings: list[tuple[float, float, float]] = []
+        for sample in samples:
+            voltage = sample.get("panel_voltage_v")
+            current = sample.get("panel_current_a")
+            acceptance = sample.get("battery_acceptance_power_w")
+            if (
+                not _is_finite_number(voltage)
+                or voltage < 0
+                or not _is_finite_number(current)
+                or current < 0
+                or not _is_finite_number(acceptance)
+                or acceptance < 0
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_samples",
+                    "panel_voltage_v, panel_current_a and "
+                    "battery_acceptance_power_w must be non-negative finite numbers",
+                )
+            readings.append((float(voltage), float(current), float(acceptance)))
+
+        max_input_power, curve = self._parse_solar_harvester(payload.get("harvester"))
+
+        estimates: list[dict[str, Any]] = []
+        powers: list[dict[str, float]] = []
+        for index in range(len(samples)):
+            panel_voltage, panel_current, acceptance_power = readings[index]
+            available_power = panel_voltage * panel_current
+            harvester_input_power = min(available_power, max_input_power)
+            efficiency = _interpolate_efficiency(harvester_input_power, curve)
+            converted_power = harvester_input_power * efficiency
+            harvested_power = min(converted_power, acceptance_power)
+            conversion_loss_power = harvester_input_power - converted_power
+            curtailed_power = available_power - harvester_input_power
+            rejected_power = converted_power - harvested_power
+            point_powers = {
+                "available": available_power,
+                "harvested": harvested_power,
+                "conversion_loss": conversion_loss_power,
+                "curtailed": curtailed_power,
+                "rejected": rejected_power,
+            }
+            powers.append(point_powers)
+            estimates.append(
+                {
+                    "timestamp_s": samples[index]["timestamp_s"],
+                    "available_power_w": available_power,
+                    "harvester_input_power_w": harvester_input_power,
+                    "converted_power_w": converted_power,
+                    "harvested_power_w": harvested_power,
+                    "conversion_loss_power_w": conversion_loss_power,
+                    "curtailed_power_w": curtailed_power,
+                    "rejected_power_w": rejected_power,
+                }
+            )
+
+        energies = {
+            "available": 0.0,
+            "harvested": 0.0,
+            "conversion_loss": 0.0,
+            "curtailed": 0.0,
+            "rejected": 0.0,
+        }
+        for index in range(1, len(samples)):
+            delta_time = timestamps[index] - timestamps[index - 1]
+            for key in energies:
+                energies[key] += (
+                    (powers[index - 1][key] + powers[index][key])
+                    / 2.0
+                    * delta_time
+                    / 3600.0
+                )
+
+        overall_efficiency = (
+            energies["harvested"] / energies["available"]
+            if energies["available"] != 0.0
+            else 0.0
+        )
+
+        return {
+            "estimates": estimates,
+            "available_energy_wh": energies["available"],
+            "harvested_energy_wh": energies["harvested"],
+            "conversion_loss_energy_wh": energies["conversion_loss"],
+            "curtailed_energy_wh": energies["curtailed"],
+            "rejected_energy_wh": energies["rejected"],
+            "overall_efficiency": overall_efficiency,
+        }
+
+    @staticmethod
+    def _parse_solar_harvester(
+        harvester: Any,
+    ) -> tuple[float, list[tuple[float, float]]]:
+        if not isinstance(harvester, dict):
+            raise ApiError(
+                422, "invalid_harvester_config", "harvester must be an object"
+            )
+
+        max_input_power = harvester.get("max_input_power_w")
+        if not _is_finite_number(max_input_power) or max_input_power <= 0:
+            raise ApiError(
+                422,
+                "invalid_harvester_config",
+                "max_input_power_w must be a positive finite number",
+            )
+
+        curve = harvester.get("efficiency_curve")
+        if not isinstance(curve, list) or len(curve) < 2:
+            raise ApiError(
+                422,
+                "invalid_harvester_config",
+                "efficiency_curve must contain at least two points",
+            )
+        points: list[tuple[float, float]] = []
+        previous_input: float | None = None
+        for point in curve:
+            if not isinstance(point, dict):
+                raise ApiError(
+                    422,
+                    "invalid_harvester_config",
+                    "each efficiency curve point must be an object",
+                )
+            input_power = point.get("input_power_w")
+            efficiency = point.get("efficiency")
+            if not _is_finite_number(input_power) or input_power < 0:
+                raise ApiError(
+                    422,
+                    "invalid_harvester_config",
+                    "efficiency curve input_power_w must be a non-negative "
+                    "finite number",
+                )
+            if not _is_finite_number(efficiency) or not 0.0 < efficiency <= 1.0:
+                raise ApiError(
+                    422,
+                    "invalid_harvester_config",
+                    "efficiency curve efficiency must be within (0, 1]",
+                )
+            if previous_input is not None and input_power <= previous_input:
+                raise ApiError(
+                    422,
+                    "invalid_harvester_config",
+                    "efficiency curve input_power_w must be strictly increasing",
+                )
+            points.append((float(input_power), float(efficiency)))
+            previous_input = input_power
+
+        return float(max_input_power), points
+
     def protect_thermal(self, payload: Any) -> dict[str, Any]:
         """Limit charge current from cell temperature with a latching cutoff.
 

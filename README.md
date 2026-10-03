@@ -139,6 +139,21 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`cells` 结构非法为 `422 invalid_cells`；`id` 缺失、为空或重复为 `422 invalid_cell_id`；电压、温度非法分别为 `422 invalid_cell_voltage`、`422 invalid_cell_temperature`；`config` 缺失或非法为 `422 invalid_balance_config`；`previous_active_ids` 类型错误、重复或引用未知 id 为 `422 invalid_previous_active_ids`。
 
+## 太阳能采集核算
+
+`POST /v1/energy/solar/harvest/estimate`（也可直接调用 `Service.estimate_solar_harvest`）依据面板采样点核算采集器转换功率、损耗与累计能量。
+
+请求字段：
+
+- `samples`（必填）：至少两项的数组，每项为对象，含严格递增的有限 `timestamp_s` 以及非负有限数 `panel_voltage_v`、`panel_current_a`、`battery_acceptance_power_w`；布尔值不作为数值接受。
+- `harvester`（必填）：对象，含正有限数 `max_input_power_w` 与至少两点的 `efficiency_curve`；曲线每项为对象，`input_power_w` 为非负有限数且严格递增，`efficiency` 位于 `(0, 1]`。
+
+每点 `available_power_w` 为面板电压乘电流；`harvester_input_power_w` 取它与最大输入功率的较小值。效率按采集器输入功率在效率曲线上线性插值（越界取最近端点）；`converted_power_w` 为采集器输入功率乘效率，`harvested_power_w` 取它与电池接收上限的较小值。`conversion_loss_power_w`、`curtailed_power_w`、`rejected_power_w` 分别为转换损耗（采集器输入减转换后功率）、超过采集器输入上限的面板功率、超过电池接收上限的转换后功率。
+
+响应 `estimates` 与输入等长同序，每项含 `timestamp_s`（原样保留）、`available_power_w`、`harvester_input_power_w`、`converted_power_w`、`harvested_power_w`、`conversion_loss_power_w`、`curtailed_power_w`、`rejected_power_w`。顶层对相邻点的上述五类功率（available、harvested、conversion_loss、curtailed、rejected）作梯形积分并除以 `3600`，返回 `available_energy_wh`、`harvested_energy_wh`、`conversion_loss_energy_wh`、`curtailed_energy_wh`、`rejected_energy_wh`；`overall_efficiency` 为采集能量除以可用能量，可用能量为零时取 `0`。成功返回 `200`，计算使用未舍入值，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 不是至少两项的对象数组，或其时间戳、面板读数、接收功率非法为 `422 invalid_samples`；`harvester` 不是对象、`max_input_power_w` 非法，或效率曲线的结构、数值、顺序非法为 `422 invalid_harvester_config`。
+
 ## 验证
 
 ```bash
