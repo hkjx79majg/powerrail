@@ -18,6 +18,7 @@ TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
 THERMAL_PROTECT_ROUTE = "/v1/battery/thermal/protect"
 BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
 SOLAR_HARVEST_ROUTE = "/v1/energy/solar/harvest/estimate"
+PARALLEL_DISPATCH_ROUTE = "/v1/battery/packs/parallel/dispatch"
 
 
 def env_address() -> tuple[str, int]:
@@ -56,6 +57,7 @@ class Handler(BaseHTTPRequestHandler):
             THERMAL_PROTECT_ROUTE,
             BALANCE_PLAN_ROUTE,
             SOLAR_HARVEST_ROUTE,
+            PARALLEL_DISPATCH_ROUTE,
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
@@ -88,6 +90,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.plan_balance(payload)
             elif self.path == SOLAR_HARVEST_ROUTE:
                 result = self.service.estimate_solar_harvest(payload)
+            elif self.path == PARALLEL_DISPATCH_ROUTE:
+                result = self.service.dispatch_parallel(payload)
             else:
                 result = self.service.filter_telemetry(payload)
         except ApiError as exc:

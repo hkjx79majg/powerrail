@@ -139,6 +139,21 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`cells` 结构非法为 `422 invalid_cells`；`id` 缺失、为空或重复为 `422 invalid_cell_id`；电压、温度非法分别为 `422 invalid_cell_voltage`、`422 invalid_cell_temperature`；`config` 缺失或非法为 `422 invalid_balance_config`；`previous_active_ids` 类型错误、重复或引用未知 id 为 `422 invalid_previous_active_ids`。
 
+## 多电池包并联放电调度
+
+`POST /v1/battery/packs/parallel/dispatch`（也可直接调用 `Service.dispatch_parallel`）在多电池包并联场景下逐样本分配母线放电电流，并对故障或压差过大的包执行隔离与恢复。
+
+请求字段：
+
+- `config`（必填）：对象，含非负有限数 `max_bus_voltage_delta_v`（包电压与母线电压允许的最大绝对差）和正整数 `recovery_samples`（恢复所需连续安全样本数）。
+- `samples`（必填）：非空数组，每项为对象，含严格递增的有限 `timestamp_s`、非负有限 `requested_bus_current_a`、正有限 `bus_voltage_v` 和非空 `packs` 数组。每个包含唯一非空字符串 `id`（各样本的 id 集合必须一致）、正有限数 `voltage_v`、非负有限 `max_discharge_current_a` 和布尔 `fault`。
+
+所有包初始接通。`fault` 为 `true` 或 `|voltage_v - bus_voltage_v| > max_bus_voltage_delta_v` 时，该包在当前样本立即隔离并分配零电流。隔离包连续 `recovery_samples` 个样本均不命中上述条件后，在最后一个安全样本重新接通并参与分配；期间再次出现不安全样本会把连续计数清零。母线请求在接通包间等额分配，达到自身 `max_discharge_current_a` 的包固定在上限，余量由其余接通包继续等分，直至请求满足或全部接通包到达上限。
+
+响应 `decisions` 与样本等长同序，每项含 `timestamp_s`（原样保留）、`pack_decisions`、`allocated_bus_current_a`、`unmet_bus_current_a` 和 `status`；`pack_decisions` 按该样本输入顺序给出 `id`、`allocated_current_a` 和 `state`（`connected` 或 `isolated`）。未满足量为零时 `status` 为 `satisfied`；请求大于零且无接通包时为 `no_available_pack`；其余为 `constrained`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`config` 结构或字段非法为 `422 invalid_parallel_config`；`samples` 结构、时间戳、母线请求电流或母线电压非法为 `422 invalid_samples`；`packs` 结构、id 集合或包字段非法为 `422 invalid_packs`。
+
 ## 验证
 
 ```bash
