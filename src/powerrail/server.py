@@ -17,6 +17,7 @@ LDO_EFFICIENCY_ROUTE = "/v1/power/ldo/efficiency/estimate"
 TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
 THERMAL_PROTECT_ROUTE = "/v1/battery/thermal/protect"
 BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
+PARALLEL_DISPATCH_ROUTE = "/v1/battery/packs/parallel/dispatch"
 SOLAR_HARVEST_ROUTE = "/v1/energy/solar/harvest/estimate"
 
 
@@ -55,6 +56,7 @@ class Handler(BaseHTTPRequestHandler):
             TELEMETRY_FILTER_ROUTE,
             THERMAL_PROTECT_ROUTE,
             BALANCE_PLAN_ROUTE,
+            PARALLEL_DISPATCH_ROUTE,
             SOLAR_HARVEST_ROUTE,
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
@@ -86,6 +88,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.protect_thermal(payload)
             elif self.path == BALANCE_PLAN_ROUTE:
                 result = self.service.plan_balance(payload)
+            elif self.path == PARALLEL_DISPATCH_ROUTE:
+                result = self.service.dispatch_parallel_packs(payload)
             elif self.path == SOLAR_HARVEST_ROUTE:
                 result = self.service.estimate_solar_harvest(payload)
             else:

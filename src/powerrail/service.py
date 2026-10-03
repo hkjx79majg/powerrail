@@ -1205,6 +1205,258 @@ class Service:
             "status": "balancing" if active_ids else "idle",
         }
 
+    def dispatch_parallel_packs(self, payload: Any) -> dict[str, Any]:
+        """Dispatch bus current across parallel battery packs with fault isolation.
+
+        All packs start connected. A pack is isolated at the current sample
+        when its fault flag is set or its voltage deviates from the bus
+        voltage by more than ``max_bus_voltage_delta_v``; isolated packs are
+        allocated zero current. An isolated pack reconnects at the last of
+        ``recovery_samples`` consecutive safe samples; an unsafe sample
+        resets that streak. The bus request is shared equally among
+        connected packs, capping each at its own maximum and redistributing
+        the remainder equally among the rest until the request is met or
+        every connected pack is at its cap.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            raise ApiError(
+                422, "invalid_parallel_config", "config must be an object"
+            )
+
+        max_voltage_delta = config.get("max_bus_voltage_delta_v")
+        if not _is_finite_number(max_voltage_delta) or max_voltage_delta < 0:
+            raise ApiError(
+                422,
+                "invalid_parallel_config",
+                "max_bus_voltage_delta_v must be a non-negative finite number",
+            )
+
+        recovery_samples = config.get("recovery_samples")
+        if (
+            not isinstance(recovery_samples, int)
+            or isinstance(recovery_samples, bool)
+            or recovery_samples < 1
+        ):
+            raise ApiError(
+                422,
+                "invalid_parallel_config",
+                "recovery_samples must be a positive integer",
+            )
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ApiError(
+                422, "invalid_samples", "samples must be a non-empty array"
+            )
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(
+                    422, "invalid_samples", "each sample must be an object"
+                )
+
+        timestamps: list[float] = []
+        requested_currents: list[float] = []
+        bus_voltages: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_samples", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422,
+                    "invalid_samples",
+                    "timestamp_s must be strictly increasing",
+                )
+            requested = sample.get("requested_bus_current_a")
+            if not _is_finite_number(requested) or requested < 0:
+                raise ApiError(
+                    422,
+                    "invalid_samples",
+                    "requested_bus_current_a must be a non-negative finite number",
+                )
+            bus_voltage = sample.get("bus_voltage_v")
+            if not _is_finite_number(bus_voltage) or bus_voltage <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_samples",
+                    "bus_voltage_v must be a positive finite number",
+                )
+            timestamps.append(float(timestamp))
+            requested_currents.append(float(requested))
+            bus_voltages.append(float(bus_voltage))
+            previous_timestamp = timestamp
+
+        sample_pack_ids: list[list[str]] = []
+        sample_pack_voltages: list[list[float]] = []
+        sample_pack_max_currents: list[list[float]] = []
+        sample_pack_faults: list[list[bool]] = []
+        reference_ids: set[str] | None = None
+        for sample in samples:
+            packs = sample.get("packs")
+            if not isinstance(packs, list) or not packs:
+                raise ApiError(
+                    422, "invalid_packs", "packs must be a non-empty array"
+                )
+            ids: list[str] = []
+            voltages: list[float] = []
+            max_currents: list[float] = []
+            faults: list[bool] = []
+            seen_ids: set[str] = set()
+            for pack in packs:
+                if not isinstance(pack, dict):
+                    raise ApiError(
+                        422, "invalid_packs", "each pack must be an object"
+                    )
+                pack_id = pack.get("id")
+                if not isinstance(pack_id, str) or not pack_id:
+                    raise ApiError(
+                        422,
+                        "invalid_packs",
+                        "each pack id must be a non-empty string",
+                    )
+                if pack_id in seen_ids:
+                    raise ApiError(
+                        422,
+                        "invalid_packs",
+                        f"pack id {pack_id!r} is duplicated",
+                    )
+                seen_ids.add(pack_id)
+                voltage = pack.get("voltage_v")
+                if not _is_finite_number(voltage) or voltage <= 0:
+                    raise ApiError(
+                        422,
+                        "invalid_packs",
+                        "voltage_v must be a positive finite number",
+                    )
+                max_current = pack.get("max_discharge_current_a")
+                if not _is_finite_number(max_current) or max_current < 0:
+                    raise ApiError(
+                        422,
+                        "invalid_packs",
+                        "max_discharge_current_a must be a non-negative "
+                        "finite number",
+                    )
+                fault = pack.get("fault")
+                if not isinstance(fault, bool):
+                    raise ApiError(
+                        422, "invalid_packs", "fault must be a boolean"
+                    )
+                ids.append(pack_id)
+                voltages.append(float(voltage))
+                max_currents.append(float(max_current))
+                faults.append(fault)
+            if reference_ids is None:
+                reference_ids = set(ids)
+            elif set(ids) != reference_ids:
+                raise ApiError(
+                    422,
+                    "invalid_packs",
+                    "each sample must carry the same set of pack ids",
+                )
+            sample_pack_ids.append(ids)
+            sample_pack_voltages.append(voltages)
+            sample_pack_max_currents.append(max_currents)
+            sample_pack_faults.append(faults)
+
+        max_voltage_delta = float(max_voltage_delta)
+        connected: dict[str, bool] = {
+            pack_id: True for pack_id in sample_pack_ids[0]
+        }
+        safe_streak: dict[str, int] = {
+            pack_id: 0 for pack_id in sample_pack_ids[0]
+        }
+
+        decisions: list[dict[str, Any]] = []
+        for index in range(len(samples)):
+            ids = sample_pack_ids[index]
+            voltages = sample_pack_voltages[index]
+            max_currents = sample_pack_max_currents[index]
+            faults = sample_pack_faults[index]
+            bus_voltage = bus_voltages[index]
+            request = requested_currents[index]
+
+            states: dict[str, bool] = {}
+            caps: dict[str, float] = {}
+            for position, pack_id in enumerate(ids):
+                unsafe = (
+                    faults[position]
+                    or abs(voltages[position] - bus_voltage) > max_voltage_delta
+                )
+                if connected[pack_id]:
+                    if unsafe:
+                        connected[pack_id] = False
+                        safe_streak[pack_id] = 0
+                else:
+                    if unsafe:
+                        safe_streak[pack_id] = 0
+                    else:
+                        safe_streak[pack_id] += 1
+                        if safe_streak[pack_id] >= recovery_samples:
+                            connected[pack_id] = True
+                            safe_streak[pack_id] = 0
+                states[pack_id] = connected[pack_id]
+                caps[pack_id] = max_currents[position]
+
+            allocation: dict[str, float] = {pack_id: 0.0 for pack_id in ids}
+            active = [pack_id for pack_id in ids if states[pack_id]]
+            remaining = request
+            while active and remaining > 0.0:
+                share = remaining / len(active)
+                still_active: list[str] = []
+                for pack_id in active:
+                    room = caps[pack_id] - allocation[pack_id]
+                    if room <= share:
+                        allocation[pack_id] = caps[pack_id]
+                        remaining -= room
+                    else:
+                        still_active.append(pack_id)
+                if len(still_active) == len(active):
+                    for pack_id in active:
+                        allocation[pack_id] += share
+                    remaining = 0.0
+                else:
+                    active = still_active
+
+            allocated = sum(allocation[pack_id] for pack_id in ids)
+            unmet = request - allocated
+            if unmet < 0.0 or unmet <= 1e-9 * max(request, 1.0):
+                unmet = 0.0
+                allocated = request
+
+            if unmet == 0.0:
+                status = "satisfied"
+            elif request > 0.0 and not any(states[pack_id] for pack_id in ids):
+                status = "no_available_pack"
+            else:
+                status = "constrained"
+
+            pack_decisions = [
+                {
+                    "id": pack_id,
+                    "allocated_current_a": allocation[pack_id],
+                    "state": "connected" if states[pack_id] else "isolated",
+                }
+                for pack_id in ids
+            ]
+            decisions.append(
+                {
+                    "timestamp_s": timestamps[index],
+                    "pack_decisions": pack_decisions,
+                    "allocated_bus_current_a": allocated,
+                    "unmet_bus_current_a": unmet,
+                    "status": status,
+                }
+            )
+
+        return {"decisions": decisions}
+
     @staticmethod
     def _parse_balance_config(
         config: Any, cell_count: int
