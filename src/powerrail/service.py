@@ -1738,6 +1738,133 @@ class Service:
             "fault_count": fault_count,
         }
 
+    def compare_energy_benchmark(self, payload: Any) -> dict[str, Any]:
+        """Compare per-scenario baseline and current run power averages.
+
+        Each run's average power is ``energy_wh * 3600 / duration_s`` and
+        each group reduces to the arithmetic mean. A scenario regresses
+        when the current mean power is strictly above the baseline mean
+        scaled by ``1 + threshold/100`` and improves when it is strictly
+        below the baseline scaled by ``1 - threshold/100``; otherwise it
+        is stable. When the baseline power is zero, ``change_percent`` is
+        ``0.0`` if the current power is also zero and ``None`` otherwise.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        scenarios = payload.get("scenarios")
+        if not isinstance(scenarios, list) or not scenarios:
+            raise ApiError(
+                422, "invalid_scenarios", "scenarios must be a non-empty array"
+            )
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                raise ApiError(
+                    422, "invalid_scenarios", "each scenario must be an object"
+                )
+
+        threshold = payload.get("regression_threshold_percent", 5.0)
+        if not _is_finite_number(threshold) or threshold < 0:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "regression_threshold_percent must be a non-negative finite number",
+            )
+        threshold = float(threshold)
+
+        results: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for scenario in scenarios:
+            scenario_id = scenario.get("id")
+            if not isinstance(scenario_id, str) or not scenario_id:
+                raise ApiError(
+                    422,
+                    "invalid_scenario_id",
+                    "each scenario id must be a non-empty string",
+                )
+            if scenario_id in seen_ids:
+                raise ApiError(
+                    422,
+                    "invalid_scenario_id",
+                    f"scenario id {scenario_id!r} is duplicated",
+                )
+            seen_ids.add(scenario_id)
+
+            baseline_power = self._mean_run_power(scenario.get("baseline_runs"))
+            current_power = self._mean_run_power(scenario.get("current_runs"))
+
+            delta_power = current_power - baseline_power
+            if baseline_power > 0.0:
+                change_percent: float | None = delta_power / baseline_power * 100.0
+            elif current_power == 0.0:
+                change_percent = 0.0
+            else:
+                change_percent = None
+
+            upper = baseline_power * (1.0 + threshold / 100.0)
+            lower = baseline_power * (1.0 - threshold / 100.0)
+            if current_power > upper:
+                status = "regression"
+            elif current_power < lower:
+                status = "improvement"
+            else:
+                status = "stable"
+
+            results.append(
+                {
+                    "id": scenario_id,
+                    "baseline_power_w": baseline_power,
+                    "current_power_w": current_power,
+                    "delta_power_w": delta_power,
+                    "change_percent": change_percent,
+                    "status": status,
+                }
+            )
+
+        regression_count = sum(1 for result in results if result["status"] == "regression")
+        improvement_count = sum(
+            1 for result in results if result["status"] == "improvement"
+        )
+        if regression_count:
+            overall_status = "regression"
+        elif improvement_count:
+            overall_status = "improvement"
+        else:
+            overall_status = "stable"
+
+        return {
+            "results": results,
+            "regression_count": regression_count,
+            "improvement_count": improvement_count,
+            "overall_status": overall_status,
+        }
+
+    @staticmethod
+    def _mean_run_power(runs: Any) -> float:
+        """Arithmetic mean of per-run average power over a non-empty run set."""
+        if not isinstance(runs, list) or not runs:
+            raise ApiError(422, "invalid_runs", "runs must be a non-empty array")
+        total_power = 0.0
+        for run in runs:
+            if not isinstance(run, dict):
+                raise ApiError(422, "invalid_runs", "each run must be an object")
+            energy = run.get("energy_wh")
+            duration = run.get("duration_s")
+            if not _is_finite_number(energy) or energy < 0:
+                raise ApiError(
+                    422,
+                    "invalid_run_measurement",
+                    "energy_wh must be a non-negative finite number",
+                )
+            if not _is_finite_number(duration) or duration <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_run_measurement",
+                    "duration_s must be a positive finite number",
+                )
+            total_power += float(energy) * 3600.0 / float(duration)
+        return total_power / len(runs)
+
     @staticmethod
     def _parse_balance_config(
         config: Any, cell_count: int
