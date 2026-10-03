@@ -69,6 +69,26 @@ def _interpolate_ocv(voltage: float, points: list[tuple[float, float]]) -> float
     return last_soc  # pragma: no cover - unreachable for a sorted curve
 
 
+def _interpolate_model_ocv(
+    soc: float, points: list[tuple[float, float]]
+) -> float:
+    """Linearly interpolate OCV voltage from a SoC-sorted curve.
+
+    SoC values outside the curve resolve to the nearest endpoint.
+    """
+    first_soc, first_voltage = points[0]
+    last_soc, last_voltage = points[-1]
+    if soc <= first_soc:
+        return first_voltage
+    if soc >= last_soc:
+        return last_voltage
+    for (s0, v0), (s1, v1) in zip(points, points[1:]):
+        if soc <= s1:
+            ratio = (soc - s0) / (s1 - s0)
+            return v0 + ratio * (v1 - v0)
+    return last_voltage  # pragma: no cover - unreachable for a sorted curve
+
+
 def _interpolate_efficiency(
     current: float, points: list[tuple[float, float]]
 ) -> float:
@@ -222,6 +242,106 @@ class Service:
             )
 
         return {"estimates": estimates, "final_soc": soc}
+
+    def simulate_battery_model(self, payload: Any) -> dict[str, Any]:
+        """Simulate terminal voltage with a first-order Thevenin model.
+
+        The first estimate uses ``initial_soc`` with zero polarization.
+        Each later interval integrates the *previous* sample's current:
+        SoC drops by coulomb counting (clamped to [0, 1]) and the RC
+        polarization voltage follows its zero-order-hold response. OCV is
+        linearly interpolated from the SoC-keyed curve, and the terminal
+        voltage subtracts the ohmic drop of the current sample's current
+        and the polarization voltage.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        capacity = payload.get("capacity_ah")
+        if not _is_finite_number(capacity) or capacity <= 0:
+            raise ApiError(
+                422, "invalid_capacity", "capacity_ah must be a positive finite number"
+            )
+
+        initial_soc = payload.get("initial_soc")
+        if not _is_finite_number(initial_soc) or not 0 <= initial_soc <= 1:
+            raise ApiError(
+                422,
+                "invalid_initial_soc",
+                "initial_soc must be a finite number within [0, 1]",
+            )
+
+        r0, r1, c1 = self._parse_battery_model(payload.get("model"))
+        ocv_points = self._parse_model_ocv_curve(payload.get("ocv_curve"))
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ApiError(422, "invalid_samples", "samples must be a non-empty array")
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(422, "invalid_samples", "each sample must be an object")
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(float(timestamp))
+            previous_timestamp = timestamp
+
+        currents: list[float] = []
+        for sample in samples:
+            current = sample.get("current_a")
+            if not _is_finite_number(current):
+                raise ApiError(
+                    422, "invalid_current", "current_a must be a finite number"
+                )
+            currents.append(float(current))
+
+        capacity = float(capacity)
+        capacity_seconds = capacity * 3600.0
+        time_constant = r1 * c1
+
+        estimates: list[dict[str, Any]] = []
+        soc = float(initial_soc)
+        polarization = 0.0
+        for index in range(len(samples)):
+            if index > 0:
+                delta_time = timestamps[index] - timestamps[index - 1]
+                previous_current = currents[index - 1]
+                soc -= previous_current * delta_time / capacity_seconds
+                if soc < 0.0:
+                    soc = 0.0
+                elif soc > 1.0:
+                    soc = 1.0
+                decay = math.exp(-delta_time / time_constant)
+                polarization = (
+                    polarization * decay + r1 * previous_current * (1.0 - decay)
+                )
+            ocv = _interpolate_model_ocv(soc, ocv_points)
+            terminal = ocv - currents[index] * r0 - polarization
+            estimates.append(
+                {
+                    "timestamp_s": samples[index]["timestamp_s"],
+                    "soc": soc,
+                    "ocv_voltage_v": ocv,
+                    "polarization_voltage_v": polarization,
+                    "terminal_voltage_v": terminal,
+                }
+            )
+
+        return {
+            "estimates": estimates,
+            "final_soc": estimates[-1]["soc"],
+            "final_terminal_voltage_v": estimates[-1]["terminal_voltage_v"],
+        }
 
     def estimate_health(self, payload: Any) -> dict[str, Any]:
         """Estimate battery state of health and remaining cycle life."""
@@ -2910,6 +3030,72 @@ class Service:
                 remaining = 0.0
                 break
         return remaining
+
+    @staticmethod
+    def _parse_battery_model(model: Any) -> tuple[float, float, float]:
+        if not isinstance(model, dict):
+            raise ApiError(422, "invalid_battery_model", "model must be an object")
+        r0 = model.get("r0_ohm")
+        r1 = model.get("r1_ohm")
+        c1 = model.get("c1_f")
+        if (
+            not _is_finite_number(r0)
+            or r0 <= 0
+            or not _is_finite_number(r1)
+            or r1 <= 0
+            or not _is_finite_number(c1)
+            or c1 <= 0
+        ):
+            raise ApiError(
+                422,
+                "invalid_battery_model",
+                "r0_ohm, r1_ohm and c1_f must be positive finite numbers",
+            )
+        return float(r0), float(r1), float(c1)
+
+    @staticmethod
+    def _parse_model_ocv_curve(curve: Any) -> list[tuple[float, float]]:
+        if not isinstance(curve, list) or len(curve) < 2:
+            raise ApiError(
+                422, "invalid_ocv_curve", "ocv_curve must contain at least two points"
+            )
+        points: list[tuple[float, float]] = []
+        previous_soc: float | None = None
+        previous_voltage: float | None = None
+        for point in curve:
+            if not isinstance(point, dict):
+                raise ApiError(
+                    422, "invalid_ocv_curve", "each OCV point must be an object"
+                )
+            voltage = point.get("voltage_v")
+            soc = point.get("soc")
+            if not _is_finite_number(voltage) or not _is_finite_number(soc):
+                raise ApiError(
+                    422,
+                    "invalid_ocv_curve",
+                    "OCV point voltage_v and soc must be finite numbers",
+                )
+            if not 0 <= soc <= 1:
+                raise ApiError(
+                    422, "invalid_ocv_curve", "OCV point soc must be within [0, 1]"
+                )
+            if previous_soc is not None:
+                if soc <= previous_soc:
+                    raise ApiError(
+                        422,
+                        "invalid_ocv_curve",
+                        "OCV point soc must be strictly increasing",
+                    )
+                if voltage <= previous_voltage:
+                    raise ApiError(
+                        422,
+                        "invalid_ocv_curve",
+                        "OCV point voltage_v must be strictly increasing",
+                    )
+            points.append((float(soc), float(voltage)))
+            previous_soc = soc
+            previous_voltage = voltage
+        return points
 
     @staticmethod
     def _parse_ocv_curve(

@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .service import ApiError, Service
 
 SOC_ROUTE = "/v1/battery/soc/estimate"
+BATTERY_MODEL_ROUTE = "/v1/battery/model/simulate"
 HEALTH_ROUTE = "/v1/battery/health/estimate"
 POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
 LOAD_SHED_ROUTE = "/v1/power/load-shed/decide"
@@ -54,6 +55,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path not in (
             SOC_ROUTE,
+            BATTERY_MODEL_ROUTE,
             HEALTH_ROUTE,
             POWER_BUDGET_ROUTE,
             LOAD_SHED_ROUTE,
@@ -86,6 +88,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == SOC_ROUTE:
                 result = self.service.estimate_soc(payload)
+            elif self.path == BATTERY_MODEL_ROUTE:
+                result = self.service.simulate_battery_model(payload)
             elif self.path == HEALTH_ROUTE:
                 result = self.service.estimate_health(payload)
             elif self.path == POWER_BUDGET_ROUTE:

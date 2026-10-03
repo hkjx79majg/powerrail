@@ -27,6 +27,21 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 响应 `estimates` 与采样等长同序，每项含 `timestamp_s`、`soc`、`source`；`final_soc` 等于末项 `soc`。错误响应统一为 `{"error":{"code":...}}`：非法或非对象 JSON 为 `400 invalid_json`；`capacity_ah`、`initial_soc`、`samples`、`timestamp_s`、`current_a`/`voltage_v`、`ocv_curve`、可选项不合法分别返回 `422` 与 `invalid_capacity`、`invalid_initial_soc`、`invalid_samples`、`invalid_timestamp`、`invalid_measurement`、`invalid_ocv_curve`、`invalid_options`。
 
+## 电池一阶 Thevenin 模型仿真
+
+`POST /v1/battery/model/simulate`（也可直接调用 `Service.simulate_battery_model`）按一阶 Thevenin 等效电路模型对电流序列做带载电压仿真（正电流放电、负电流充电）。
+请求字段：
+
+- `capacity_ah`（必填）：正有限数电池容量（安时）。
+- `initial_soc`（必填）：`[0, 1]` 内的初始 SoC。
+- `model`（必填）：对象，含正有限数 `r0_ohm`、`r1_ohm`、`c1_f`（欧姆电阻、极化电阻、极化电容）。
+- `ocv_curve`（必填）：至少两个点，`soc` 与 `voltage_v` 均严格递增，且 `soc` 位于 `[0, 1]`。
+- `samples`（必填）：非空数组，每项含严格递增的有限 `timestamp_s` 与有限 `current_a`。
+
+算法：首个结果采用 `initial_soc`、极化电压为零。后续区间使用前一样本电流 `I` 与时间差 `dt`：`soc = clamp(soc - I*dt/(capacity_ah*3600), 0, 1)`；极化电压更新为 `v*exp(-dt/(r1_ohm*c1_f)) + r1_ohm*I*(1-exp(-dt/(r1_ohm*c1_f)))`。开路电压按当前 SoC 在曲线上线性插值（SoC 为自变量，越界取端点）；端电压为 `ocv - 当前样本电流*r0_ohm - 极化电压`。
+
+响应 `estimates` 与样本等长同序，每项含 `timestamp_s`、`soc`、`ocv_voltage_v`、`polarization_voltage_v`、`terminal_voltage_v`；顶层 `final_soc`、`final_terminal_voltage_v` 取末项值，成功返回 `200` 且不修改请求对象。错误语义：`400 invalid_json`（请求体缺失、解析失败或顶层非对象）；`422` 依次为 `invalid_capacity`、`invalid_initial_soc`、`invalid_battery_model`、`invalid_ocv_curve`、`invalid_samples`、`invalid_timestamp`、`invalid_current`，布尔值不视为数值。
+
 ## 电池健康度与循环寿命估算
 
 `POST /v1/battery/health/estimate`（也可直接调用 `Service.estimate_health`）依据容量检测记录估算电池健康度（SoH）与剩余等效循环次数。
