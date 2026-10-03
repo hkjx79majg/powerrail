@@ -2345,6 +2345,142 @@ class Service:
             "overall_status": overall_status,
         }
 
+    def plan_charging(self, payload: Any) -> dict[str, Any]:
+        """Plan a fixed-step charging profile with a linear current taper.
+
+        While SoC is at or below ``taper_start_soc`` the battery charges at
+        ``max_current_a``; above it the current falls linearly with the
+        remaining distance to the target, reaching ``taper_end_current_a``
+        at the target. A full step that would cross the target is shortened
+        so the final step ends exactly on the target; running out of
+        ``max_steps`` first leaves the plan incomplete.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        capacity = payload.get("capacity_ah")
+        if not _is_finite_number(capacity) or capacity <= 0:
+            raise ApiError(
+                422, "invalid_capacity", "capacity_ah must be a positive finite number"
+            )
+
+        initial_soc = payload.get("initial_soc")
+        target_soc = payload.get("target_soc")
+        if (
+            not _is_finite_number(initial_soc)
+            or not _is_finite_number(target_soc)
+            or not 0 <= initial_soc <= 1
+            or not 0 <= target_soc <= 1
+            or initial_soc > target_soc
+        ):
+            raise ApiError(
+                422,
+                "invalid_soc_range",
+                "initial_soc and target_soc must be finite numbers within "
+                "[0, 1] with initial_soc not above target_soc",
+            )
+
+        (
+            max_current,
+            charge_voltage,
+            coulombic_efficiency,
+            taper_start,
+            taper_end,
+        ) = self._parse_charge_config(payload.get("config"), float(target_soc))
+
+        step_duration = payload.get("step_duration_s")
+        if not _is_finite_number(step_duration) or step_duration <= 0:
+            raise ApiError(
+                422,
+                "invalid_plan_options",
+                "step_duration_s must be a positive finite number",
+            )
+
+        max_steps = payload.get("max_steps")
+        if (
+            not isinstance(max_steps, int)
+            or isinstance(max_steps, bool)
+            or max_steps < 1
+        ):
+            raise ApiError(
+                422,
+                "invalid_plan_options",
+                "max_steps must be a positive integer",
+            )
+
+        if initial_soc == target_soc:
+            return {
+                "steps": [],
+                "final_soc": float(initial_soc),
+                "elapsed_s": 0.0,
+                "input_energy_wh": 0.0,
+                "status": "completed",
+            }
+
+        capacity_seconds = float(capacity) * 3600.0
+        taper_span = float(target_soc) - taper_start
+        soc = float(initial_soc)
+        steps: list[dict[str, Any]] = []
+        elapsed = 0.0
+        input_energy = 0.0
+        status = "incomplete"
+
+        for _ in range(max_steps):
+            if soc <= taper_start:
+                current = max_current
+            else:
+                current = taper_end + (max_current - taper_end) * (
+                    (float(target_soc) - soc) / taper_span
+                )
+            duration = float(step_duration)
+            full_delta = (
+                current * coulombic_efficiency * duration / capacity_seconds
+            )
+            remaining_soc = float(target_soc) - soc
+            end_soc = soc + full_delta
+            if end_soc >= target_soc:
+                tolerance = 1e-12 * max(
+                    1.0, abs(full_delta), abs(remaining_soc)
+                )
+                if end_soc - float(target_soc) <= tolerance:
+                    # A full step lands on the target within floating-point
+                    # tolerance: keep it full-length and pin the end exactly.
+                    end_soc = float(target_soc)
+                else:
+                    # Shorten the crossing step so its end is exactly target.
+                    duration = (
+                        remaining_soc
+                        * capacity_seconds
+                        / (current * coulombic_efficiency)
+                    )
+                    if duration > float(step_duration):
+                        duration = float(step_duration)
+                    end_soc = float(target_soc)
+            energy = charge_voltage * current * duration / 3600.0
+            steps.append(
+                {
+                    "start_soc": soc,
+                    "end_soc": end_soc,
+                    "duration_s": duration,
+                    "current_a": current,
+                    "input_energy_wh": energy,
+                }
+            )
+            elapsed += duration
+            input_energy += energy
+            soc = end_soc
+            if end_soc == target_soc:
+                status = "completed"
+                break
+
+        return {
+            "steps": steps,
+            "final_soc": soc,
+            "elapsed_s": elapsed,
+            "input_energy_wh": input_energy,
+            "status": status,
+        }
+
     @staticmethod
     def _average_run_power(runs: Any) -> float:
         if not isinstance(runs, list) or not runs:
@@ -2371,6 +2507,69 @@ class Service:
                 )
             powers.append(float(energy) * 3600.0 / float(duration))
         return sum(powers) / len(powers)
+
+    @staticmethod
+    def _parse_charge_config(
+        config: Any, target_soc: float
+    ) -> tuple[float, float, float, float, float]:
+        if not isinstance(config, dict):
+            raise ApiError(422, "invalid_charge_config", "config must be an object")
+
+        max_current = config.get("max_current_a")
+        if not _is_finite_number(max_current) or max_current <= 0:
+            raise ApiError(
+                422,
+                "invalid_charge_config",
+                "max_current_a must be a positive finite number",
+            )
+
+        charge_voltage = config.get("charge_voltage_v")
+        if not _is_finite_number(charge_voltage) or charge_voltage <= 0:
+            raise ApiError(
+                422,
+                "invalid_charge_config",
+                "charge_voltage_v must be a positive finite number",
+            )
+
+        coulombic_efficiency = config.get("coulombic_efficiency")
+        if (
+            not _is_finite_number(coulombic_efficiency)
+            or not 0.0 < coulombic_efficiency <= 1.0
+        ):
+            raise ApiError(
+                422,
+                "invalid_charge_config",
+                "coulombic_efficiency must be a finite number within (0, 1]",
+            )
+
+        taper_start = config.get("taper_start_soc")
+        if (
+            not _is_finite_number(taper_start)
+            or not 0 <= taper_start < target_soc
+        ):
+            raise ApiError(
+                422,
+                "invalid_charge_config",
+                "taper_start_soc must be a finite number within "
+                "[0, target_soc)",
+            )
+
+        taper_end = config.get("taper_end_current_a")
+        if not _is_finite_number(taper_end) or not 0.0 < taper_end <= max_current:
+            raise ApiError(
+                422,
+                "invalid_charge_config",
+                "taper_end_current_a must be a positive finite number not "
+                "exceeding max_current_a",
+            )
+
+        return (
+            float(max_current),
+            float(charge_voltage),
+            float(coulombic_efficiency),
+            float(taper_start),
+            float(taper_end),
+        )
 
     @staticmethod
     def _parse_balance_config(

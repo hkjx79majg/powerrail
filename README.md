@@ -172,6 +172,24 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`cells` 结构非法为 `422 invalid_cells`；`id` 缺失、为空或重复为 `422 invalid_cell_id`；电压、温度非法分别为 `422 invalid_cell_voltage`、`422 invalid_cell_temperature`；`config` 缺失或非法为 `422 invalid_balance_config`；`previous_active_ids` 类型错误、重复或引用未知 id 为 `422 invalid_previous_active_ids`。
 
+## 充电过程规划
+
+`POST /v1/battery/charge/plan`（也可直接调用 `Service.plan_charging`）按固定步长生成恒流转恒压线性降流的充电过程预测。
+
+请求字段：
+
+- `capacity_ah`（必填）：正有限数电池容量（安时）。
+- `initial_soc`、`target_soc`（必填）：`[0, 1]` 内有限数，且 `initial_soc` 不高于 `target_soc`；布尔值不作为数值接受。
+- `step_duration_s`（必填）：正有限数单步时长（秒）。
+- `max_steps`（必填）：正整数最大步数。
+- `config`（必填）：对象，含正有限数 `max_current_a` 与 `charge_voltage_v`、位于 `(0, 1]` 的有限数 `coulombic_efficiency`、位于 `[0, target_soc)` 的有限数 `taper_start_soc`，以及大于零且不超过 `max_current_a` 的有限数 `taper_end_current_a`。
+
+每步电流在该步起始 SoC 处取值并在整步保持：当前 SoC 不高于 `taper_start_soc` 时为 `max_current_a`；之后随到目标的剩余距离线性下降，`current_a = taper_end_current_a + (max_current_a - taper_end_current_a) * (target_soc - soc) / (target_soc - taper_start_soc)`，到达目标时降为 `taper_end_current_a`。每步 SoC 增量为 `current_a * coulombic_efficiency * duration_s / (capacity_ah * 3600)`。整步会越过目标时缩短该步时长，使末值恰等于目标；整步在浮点容差内恰好到达目标时保持整步时长。步末 SoC 即下一步起始 SoC。
+
+响应 `steps` 按时间顺序排列，每项含 `start_soc`、`end_soc`、`duration_s`、`current_a`、`input_energy_wh`（`charge_voltage_v * current_a * duration_s / 3600`）；顶层含 `final_soc`、`elapsed_s`（各步时长之和）、`input_energy_wh`（各步能量之和）与 `status`。到达目标时 `status` 为 `completed`；`max_steps` 步耗尽仍未到目标为 `incomplete`。初始 SoC 即目标时 `steps` 为空、各汇总量为零且 `status` 为 `completed`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`capacity_ah` 非法为 `422 invalid_capacity`；SoC 越界或 `initial_soc` 高于 `target_soc` 为 `422 invalid_soc_range`；`config` 缺失、结构或字段非法为 `422 invalid_charge_config`；`step_duration_s` 或 `max_steps` 非法为 `422 invalid_plan_options`。
+
 ## 多电池包并联放电调度
 
 `POST /v1/battery/packs/parallel/dispatch`（也可直接调用 `Service.dispatch_parallel_packs`）在多电池包并联母线上执行放电调度与故障隔离。
