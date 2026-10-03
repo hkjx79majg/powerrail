@@ -199,6 +199,24 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`scenarios` 缺失、为空、非数组或成员非对象为 `422 invalid_scenarios`；`id` 非法或重复为 `422 invalid_scenario_id`；运行集合缺失、为空、非数组或含非对象为 `422 invalid_runs`；运行数值缺失、为布尔值、非有限或超出范围为 `422 invalid_run_measurement`；阈值非法为 `422 invalid_options`。
 
+## 迟滞告警与分级降载
+
+`POST /v1/power/load-shed/decide`（也可直接调用 `Service.decide_load_shedding`）依据逐样本可用功率在正常、告警、临界三级之间迟滞切换，并按级别切除负载后沿用功耗预算规则分配余下负载。
+
+请求字段：
+
+- `loads`（必填）：非空数组，负载形状与功耗预算一致（唯一非空字符串 `id`、非负有限数 `demand_power_w`、不超过需求的非负有限数 `min_power_w`、`[0, 100]` 内整数 `priority`），并增加 `shed_level`，只能取 `warning`、`critical`、`never` 之一。
+- `config`（必填）：对象，含非负有限数 `reserve_power_w`、满足 `0 < warning_shortfall_w < critical_shortfall_w` 的两个有限阈值，以及正整数 `recovery_samples`。
+- `samples`（必填）：非空数组，每项含严格递增的有限 `timestamp_s` 与非负有限 `available_power_w`；布尔值不作为数值接受。
+
+`raw_shortfall_w` 为总需求加保留功率减可用功率，下限取零。缺口达到临界阈值时目标级别为 `critical`，达到告警阈值（含相等）为 `warning`，否则为 `normal`。级别从 `normal` 开始；目标级别高于当前级别时立即升级，一次跨越两级只计一次升级；目标低于当前时，仅当该样本缺口严格低于进入当前级别的阈值才把连续计数加一，否则计数清零，计数连续达到 `recovery_samples` 后下降一级并重新计数。
+
+`warning` 级别切除所有同名（`shed_level` 为 `warning`）负载，`critical` 级别在告警基础上再切除 `critical` 负载；`never` 负载任何级别都不切除。被切除项分配为零且 `state` 为 `shed`；余下负载以“可用功率减保留功率”为可分配功率，按既有功耗预算规则分配（保底优先、按优先级与比例补足）。
+
+响应 `decisions` 与样本等长同序，每项含 `timestamp_s`、`raw_shortfall_w`、`target_level`、`level`（本样本实际生效级别）、`allocations`（与负载等长同序，字段与功耗预算一致）、`allocated_power_w`、`unallocated_power_w`、`remaining_shortfall_w` 以及 `status`；剩余缺口为零时 `status` 为 `satisfied`，处于 `critical` 且仍有缺口为 `policy_shed`，其余有缺口情形为 `constrained`。顶层含 `final_level` 与 `escalation_count`（每次升级计一，重新升级再次计数）。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`loads` 数组或元素类型非法为 `422 invalid_loads`，`id` 缺失、为空或重复为 `422 invalid_load_id`，功率字段非法为 `422 invalid_load_power`，`priority` 非法为 `422 invalid_priority`，`shed_level` 缺失或取值非法为 `422 invalid_shed_level`；`config` 缺失、结构或字段非法为 `422 invalid_load_shed_config`；`samples` 数组或元素类型非法为 `422 invalid_samples`，时间戳非法或未严格递增为 `422 invalid_timestamp`，`available_power_w` 缺失、非有限、为负或为布尔值为 `422 invalid_available_power`。
+
 ## 验证
 
 ```bash

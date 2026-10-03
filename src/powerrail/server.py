@@ -21,6 +21,7 @@ BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
 PARALLEL_DISPATCH_ROUTE = "/v1/battery/packs/parallel/dispatch"
 SOLAR_HARVEST_ROUTE = "/v1/energy/solar/harvest/estimate"
 WIRELESS_NEGOTIATE_ROUTE = "/v1/power/wireless/negotiate"
+LOAD_SHED_ROUTE = "/v1/power/load-shed/decide"
 ENERGY_BENCHMARK_COMPARE_ROUTE = "/v1/energy/benchmark/compare"
 
 
@@ -63,6 +64,7 @@ class Handler(BaseHTTPRequestHandler):
             PARALLEL_DISPATCH_ROUTE,
             SOLAR_HARVEST_ROUTE,
             WIRELESS_NEGOTIATE_ROUTE,
+            LOAD_SHED_ROUTE,
             ENERGY_BENCHMARK_COMPARE_ROUTE,
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
@@ -100,6 +102,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.estimate_solar_harvest(payload)
             elif self.path == WIRELESS_NEGOTIATE_ROUTE:
                 result = self.service.negotiate_wireless_charging(payload)
+            elif self.path == LOAD_SHED_ROUTE:
+                result = self.service.decide_load_shedding(payload)
             elif self.path == ENERGY_BENCHMARK_COMPARE_ROUTE:
                 result = self.service.compare_energy_benchmark(payload)
             elif self.path == TELEMETRY_AGGREGATE_ROUTE:
