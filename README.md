@@ -156,6 +156,23 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 数量或成员结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；`current_a`/`voltage_v` 非法为 `422 invalid_measurement`；`bucket_duration_s`、`max_gap_s` 或 `trend_threshold_w_per_hour` 缺失、为布尔值、非有限或越界为 `422 invalid_options`。
 
+## 遥测趋势基线告警
+
+`POST /v1/telemetry/trend/analyze`（也可直接调用 `Service.analyze_telemetry_trend`）对聚合窗口建立滚动功率基线并输出迟滞告警。窗口字段沿用聚合结果。
+
+请求字段：
+
+- `buckets`（必填）：非空数组，每项为对象，含有限且非布尔的 `bucket_start_s`、`bucket_end_s`、`covered_duration_s`、`average_power_w`；起点严格小于终点，起点严格递增且窗口互不重叠，覆盖时长位于零至窗口时长（`bucket_end_s - bucket_start_s`）之内。
+- `config`（必填）：对象，含正整数 `baseline_window`、`recovery_windows`，位于 `[0,1]` 的有限数 `min_coverage_ratio`，以及满足 `0 <= warning_deviation_w < critical_deviation_w` 的有限阈值。
+
+覆盖时长大于零且覆盖率（`covered_duration_s` 与窗口时长之比）达到下限的窗口才有效。对每个有效窗口，先取此前最近 `baseline_window` 个有效窗口功率的中位数为基线（偶数个取中间两值均值），再将自身功率加入历史；历史不足 `baseline_window` 个时目标为 `warming_up`、基线与偏差仍返回计算值、实际级别保持 `normal`。
+
+基线就绪后，偏差为当前功率减基线：达到临界阈值目标为 `critical`，达到告警阈值目标为 `warning`，否则为 `normal`。级别从 `normal` 开始，升级立即生效；连续 `recovery_windows` 个有效窗口的目标低于当前级别时只降一级并重新计数，其余有效窗口清零计数。无效窗口目标为 `insufficient`，基线与偏差返回 `null`，保持当前级别、清零计数且不进入历史。
+
+响应 `results` 与输入同序，每项回显 `bucket_start_s`、`bucket_end_s`、`covered_duration_s`，并含 `coverage_ratio`、`average_power_w`、`baseline_power_w`、`deviation_w`、`target_level`、`level`；顶层返回 `final_level`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；窗口结构、数值、顺序或重叠错误为 `422 invalid_buckets`；`config` 缺失、结构或数值非法为 `422 invalid_trend_config`。
+
 ## 充电热保护
 
 `POST /v1/battery/thermal/protect`（也可直接调用 `Service.protect_thermal`）按电芯温度与期望充电电流生成限流决定。
