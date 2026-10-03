@@ -13,6 +13,7 @@ SOC_ROUTE = "/v1/battery/soc/estimate"
 HEALTH_ROUTE = "/v1/battery/health/estimate"
 POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
 DCDC_EFFICIENCY_ROUTE = "/v1/power/dcdc/efficiency/estimate"
+LDO_EFFICIENCY_ROUTE = "/v1/power/ldo/efficiency/estimate"
 TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
 THERMAL_PROTECT_ROUTE = "/v1/battery/thermal/protect"
 BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
@@ -49,6 +50,7 @@ class Handler(BaseHTTPRequestHandler):
             HEALTH_ROUTE,
             POWER_BUDGET_ROUTE,
             DCDC_EFFICIENCY_ROUTE,
+            LDO_EFFICIENCY_ROUTE,
             TELEMETRY_FILTER_ROUTE,
             THERMAL_PROTECT_ROUTE,
             BALANCE_PLAN_ROUTE,
@@ -76,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.allocate_power_budget(payload)
             elif self.path == DCDC_EFFICIENCY_ROUTE:
                 result = self.service.estimate_dcdc_efficiency(payload)
+            elif self.path == LDO_EFFICIENCY_ROUTE:
+                result = self.service.estimate_ldo_efficiency(payload)
             elif self.path == THERMAL_PROTECT_ROUTE:
                 result = self.service.protect_thermal(payload)
             elif self.path == BALANCE_PLAN_ROUTE:
