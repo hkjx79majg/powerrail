@@ -24,6 +24,7 @@ PARALLEL_DISPATCH_ROUTE = "/v1/battery/packs/parallel/dispatch"
 SOLAR_HARVEST_ROUTE = "/v1/energy/solar/harvest/estimate"
 WIRELESS_NEGOTIATE_ROUTE = "/v1/power/wireless/negotiate"
 ENERGY_BENCHMARK_COMPARE_ROUTE = "/v1/energy/benchmark/compare"
+BATTERY_MODEL_SIMULATE_ROUTE = "/v1/battery/model/simulate"
 
 
 def env_address() -> tuple[str, int]:
@@ -68,6 +69,7 @@ class Handler(BaseHTTPRequestHandler):
             SOLAR_HARVEST_ROUTE,
             WIRELESS_NEGOTIATE_ROUTE,
             ENERGY_BENCHMARK_COMPARE_ROUTE,
+            BATTERY_MODEL_SIMULATE_ROUTE,
         ):
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
@@ -110,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.negotiate_wireless_charging(payload)
             elif self.path == ENERGY_BENCHMARK_COMPARE_ROUTE:
                 result = self.service.compare_energy_benchmark(payload)
+            elif self.path == BATTERY_MODEL_SIMULATE_ROUTE:
+                result = self.service.simulate_battery_model(payload)
             elif self.path == TELEMETRY_AGGREGATE_ROUTE:
                 result = self.service.aggregate_telemetry(payload)
             else:
