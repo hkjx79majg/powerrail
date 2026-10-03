@@ -154,6 +154,21 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`config` 缺失或非法为 `422 invalid_parallel_config`；`samples` 结构、时间戳、母线请求电流或母线电压非法为 `422 invalid_samples`；`packs` 结构、id 集合或包字段非法为 `422 invalid_packs`。
 
+## 无线充电协商
+
+`POST /v1/power/wireless/negotiate`（也可直接调用 `Service.negotiate_wireless_charging`）按遥测样本在充电档位间协商无线传输功率，并对异物与过热执行锁存保护。
+
+请求字段：
+
+- `config`（必填）：对象，含正有限数 `transmitter_max_power_w` 与 `receiver_max_power_w`（两端功率上限）、满足 `recovery_temperature_c < warning_temperature_c < critical_temperature_c` 的三个有限温度阈值，以及非空 `profiles`；每个档位含唯一非空 `id`、正有限数 `voltage_v` 与 `max_current_a`、布尔 `accepted`，且至少一个档位 `accepted` 为 `true`。
+- `samples`（必填）：非空数组，每项为对象，含严格递增的有限 `timestamp_s`、布尔 `receiver_present`、非负有限 `requested_power_w`、`[0, 1]` 内有限 `coupling`、有限 `coil_temperature_c` 和布尔 `foreign_object`。
+
+档位功率为 `voltage_v * max_current_a`；交付上限为档位功率与两端上限的最小值乘 `coupling` 与 `thermal_factor`。`thermal_factor` 在告警温度及以下为 `1`，告警与临界温度之间线性降至 `0`。每个样本在可接受档位中优先选交付上限满足请求的最小档位（按档位功率、`id` 升序），否则选交付上限最大者（并列按档位功率、`id` 升序）；交付功率为请求与所选档位交付上限的较小值。零请求或接收端不在位时不选档位、不传输。样本出现异物或温度达到临界值时锁存故障并停止传输；仅在后续样本接收端不在位、无异物且温度不高于恢复值时解除，该样本空闲。
+
+响应 `decisions` 与样本等长同序，每项含 `timestamp_s`（原样保留）、`selected_profile_id`、`delivered_power_w`、`unmet_power_w`、`thermal_factor`、`state`（`idle`、`charging`、`limited` 或 `fault`）和 `fault_reason`（`foreign_object`、`over_temperature` 或 `null`）；顶层 `final_state` 取末项状态，`fault_count` 统计锁存次数。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`config` 结构、功率上限或温度阈值非法为 `422 invalid_wireless_config`；`profiles` 结构或档位字段非法为 `422 invalid_profiles`；`samples` 结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；样本字段非法为 `422 invalid_wireless_sample`。
+
 ## 验证
 
 ```bash

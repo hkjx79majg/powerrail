@@ -1457,6 +1457,287 @@ class Service:
 
         return {"decisions": decisions}
 
+    def negotiate_wireless_charging(self, payload: Any) -> dict[str, Any]:
+        """Negotiate wireless charging power across telemetry samples.
+
+        Each sample picks a charge profile whose delivery cap — the
+        smallest of the profile power and both end limits, scaled by
+        coupling and a temperature derating factor — best fits the
+        request: the smallest profile that satisfies it, else the one
+        with the highest cap. A foreign object or a coil temperature at
+        the critical threshold latches a fault that stops transmission
+        until a later sample shows the receiver absent, no foreign
+        object and a temperature at or below the recovery threshold.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            raise ApiError(
+                422, "invalid_wireless_config", "config must be an object"
+            )
+
+        transmitter_limit = config.get("transmitter_max_power_w")
+        if not _is_finite_number(transmitter_limit) or transmitter_limit <= 0:
+            raise ApiError(
+                422,
+                "invalid_wireless_config",
+                "transmitter_max_power_w must be a positive finite number",
+            )
+        receiver_limit = config.get("receiver_max_power_w")
+        if not _is_finite_number(receiver_limit) or receiver_limit <= 0:
+            raise ApiError(
+                422,
+                "invalid_wireless_config",
+                "receiver_max_power_w must be a positive finite number",
+            )
+
+        recovery_temperature = config.get("recovery_temperature_c")
+        warning_temperature = config.get("warning_temperature_c")
+        critical_temperature = config.get("critical_temperature_c")
+        if (
+            not _is_finite_number(recovery_temperature)
+            or not _is_finite_number(warning_temperature)
+            or not _is_finite_number(critical_temperature)
+        ):
+            raise ApiError(
+                422,
+                "invalid_wireless_config",
+                "recovery_temperature_c, warning_temperature_c and "
+                "critical_temperature_c must be finite numbers",
+            )
+        if not recovery_temperature < warning_temperature < critical_temperature:
+            raise ApiError(
+                422,
+                "invalid_wireless_config",
+                "thresholds must satisfy recovery_temperature_c < "
+                "warning_temperature_c < critical_temperature_c",
+            )
+
+        profiles = config.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            raise ApiError(
+                422, "invalid_profiles", "profiles must be a non-empty array"
+            )
+        profile_ids: list[str] = []
+        profile_powers: list[float] = []
+        profile_accepted: list[bool] = []
+        seen_ids: set[str] = set()
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                raise ApiError(
+                    422, "invalid_profiles", "each profile must be an object"
+                )
+            profile_id = profile.get("id")
+            if not isinstance(profile_id, str) or not profile_id:
+                raise ApiError(
+                    422,
+                    "invalid_profiles",
+                    "each profile id must be a non-empty string",
+                )
+            if profile_id in seen_ids:
+                raise ApiError(
+                    422,
+                    "invalid_profiles",
+                    f"profile id {profile_id!r} is duplicated",
+                )
+            seen_ids.add(profile_id)
+            voltage = profile.get("voltage_v")
+            if not _is_finite_number(voltage) or voltage <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_profiles",
+                    "voltage_v must be a positive finite number",
+                )
+            max_current = profile.get("max_current_a")
+            if not _is_finite_number(max_current) or max_current <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_profiles",
+                    "max_current_a must be a positive finite number",
+                )
+            accepted = profile.get("accepted")
+            if not isinstance(accepted, bool):
+                raise ApiError(
+                    422, "invalid_profiles", "accepted must be a boolean"
+                )
+            profile_ids.append(profile_id)
+            profile_powers.append(float(voltage) * float(max_current))
+            profile_accepted.append(accepted)
+        if not any(profile_accepted):
+            raise ApiError(
+                422,
+                "invalid_profiles",
+                "at least one profile must be acceptable",
+            )
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ApiError(422, "invalid_samples", "samples must be a non-empty array")
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(422, "invalid_samples", "each sample must be an object")
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(timestamp)
+            previous_timestamp = timestamp
+
+        receiver_present: list[bool] = []
+        requested_powers: list[float] = []
+        couplings: list[float] = []
+        temperatures: list[float] = []
+        foreign_objects: list[bool] = []
+        for sample in samples:
+            present = sample.get("receiver_present")
+            if not isinstance(present, bool):
+                raise ApiError(
+                    422,
+                    "invalid_wireless_sample",
+                    "receiver_present must be a boolean",
+                )
+            requested = sample.get("requested_power_w")
+            if not _is_finite_number(requested) or requested < 0:
+                raise ApiError(
+                    422,
+                    "invalid_wireless_sample",
+                    "requested_power_w must be a non-negative finite number",
+                )
+            coupling = sample.get("coupling")
+            if not _is_finite_number(coupling) or not 0 <= coupling <= 1:
+                raise ApiError(
+                    422,
+                    "invalid_wireless_sample",
+                    "coupling must be a finite number within [0, 1]",
+                )
+            temperature = sample.get("coil_temperature_c")
+            if not _is_finite_number(temperature):
+                raise ApiError(
+                    422,
+                    "invalid_wireless_sample",
+                    "coil_temperature_c must be a finite number",
+                )
+            foreign_object = sample.get("foreign_object")
+            if not isinstance(foreign_object, bool):
+                raise ApiError(
+                    422,
+                    "invalid_wireless_sample",
+                    "foreign_object must be a boolean",
+                )
+            receiver_present.append(present)
+            requested_powers.append(float(requested))
+            couplings.append(float(coupling))
+            temperatures.append(float(temperature))
+            foreign_objects.append(foreign_object)
+
+        power_limit = min(float(transmitter_limit), float(receiver_limit))
+        warning_span = float(critical_temperature) - float(warning_temperature)
+        candidates = [
+            index for index in range(len(profiles)) if profile_accepted[index]
+        ]
+
+        decisions: list[dict[str, Any]] = []
+        latched = False
+        latch_reason: str | None = None
+        fault_count = 0
+        for index in range(len(samples)):
+            temperature = temperatures[index]
+            if temperature <= warning_temperature:
+                thermal_factor = 1.0
+            elif temperature >= critical_temperature:
+                thermal_factor = 0.0
+            else:
+                thermal_factor = (
+                    float(critical_temperature) - temperature
+                ) / warning_span
+
+            if latched:
+                if (
+                    not receiver_present[index]
+                    and not foreign_objects[index]
+                    and temperature <= recovery_temperature
+                ):
+                    latched = False
+                    latch_reason = None
+            if not latched and (
+                foreign_objects[index] or temperature >= critical_temperature
+            ):
+                latched = True
+                latch_reason = (
+                    "foreign_object"
+                    if foreign_objects[index]
+                    else "over_temperature"
+                )
+                fault_count += 1
+
+            selected_profile_id: str | None = None
+            delivered = 0.0
+            if latched:
+                state = "fault"
+                fault_reason = latch_reason
+            else:
+                fault_reason = None
+                if not receiver_present[index] or requested_powers[index] == 0.0:
+                    state = "idle"
+                else:
+                    requested = requested_powers[index]
+                    caps = {
+                        candidate: min(profile_powers[candidate], power_limit)
+                        * couplings[index]
+                        * thermal_factor
+                        for candidate in candidates
+                    }
+                    satisfying = [
+                        candidate
+                        for candidate in candidates
+                        if caps[candidate] >= requested
+                    ]
+                    if satisfying:
+                        chosen = min(
+                            satisfying,
+                            key=lambda c: (profile_powers[c], profile_ids[c]),
+                        )
+                    else:
+                        chosen = min(
+                            candidates,
+                            key=lambda c: (-caps[c], profile_powers[c], profile_ids[c]),
+                        )
+                    selected_profile_id = profile_ids[chosen]
+                    delivered = min(requested, caps[chosen])
+                    state = "charging" if delivered >= requested else "limited"
+
+            unmet = requested_powers[index] - delivered
+            if unmet < 0.0:
+                unmet = 0.0
+            decisions.append(
+                {
+                    "timestamp_s": samples[index]["timestamp_s"],
+                    "selected_profile_id": selected_profile_id,
+                    "delivered_power_w": delivered,
+                    "unmet_power_w": unmet,
+                    "thermal_factor": thermal_factor,
+                    "state": state,
+                    "fault_reason": fault_reason,
+                }
+            )
+
+        return {
+            "decisions": decisions,
+            "final_state": decisions[-1]["state"],
+            "fault_count": fault_count,
+        }
+
     @staticmethod
     def _parse_balance_config(
         config: Any, cell_count: int
