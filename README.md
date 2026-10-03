@@ -75,6 +75,22 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；输入电压非法为 `422 invalid_input_voltage`；静态电流非法为 `422 invalid_quiescent_current`；工况数组非法或含非对象为 `422 invalid_operating_points`，工况字段非法为 `422 invalid_operating_point`；曲线缺失、结构或数值非法、电流未严格递增为 `422 invalid_efficiency_curve`。
 
+## LDO 效率评估
+
+`POST /v1/power/ldo/efficiency/estimate`（也可直接调用 `Service.estimate_ldo_efficiency`）按工况评估线性稳压器（LDO）的效率、压差状态与累计能量。
+
+请求字段：
+
+- `operating_points`（必填）：非空数组，每项为对象，含正有限数 `duration_s`、`input_voltage_v`、`requested_output_voltage_v` 以及非负有限数 `output_current_a`。
+- `dropout_curve`（必填）：至少两个点的数组，每项为对象，`output_current_a` 与 `dropout_voltage_v` 均为非负有限数，且电流严格递增。
+- `quiescent_current_a`（可选）：非负有限数静态电流（安），默认 `0`。
+
+每个工况按输出电流在压差曲线上线性插值得到压差，越界取最近端点。最高输出电压为 `max(0, input_voltage_v - dropout_voltage_v)`，`actual_output_voltage_v` 取它与请求输出电压的较小值；最高值不低于请求值时 `state` 为 `regulated`，否则为 `dropout`。输出功率为实际输出电压乘输出电流；输入功率为输入电压乘输出电流与静态电流之和；损耗为二者之差；效率为输出功率除以输入功率，分母为零时取 `0`。各项能量按功率乘 `duration_s` 除以 `3600` 累加（使用未舍入值），总效率为总输出能量除以总输入能量，累计输入能量为零时取 `0`。
+
+响应 `estimates` 与工况等长同序，每项含 `actual_output_voltage_v`、`dropout_voltage_v`、`input_power_w`、`output_power_w`、`loss_power_w`、`efficiency`、`state`；顶层含 `input_energy_wh`、`output_energy_wh`、`loss_energy_wh`、`overall_efficiency`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；工况数组非法或含非对象为 `422 invalid_operating_points`，工况字段非法为 `422 invalid_operating_point`；压差曲线缺失、结构或数值非法、电流未严格递增为 `422 invalid_dropout_curve`；静态电流非法为 `422 invalid_quiescent_current`。
+
 ## 遥测采样过滤
 
 `POST /v1/telemetry/filter`（也可直接调用 `Service.filter_telemetry`）将含尖峰或不等间隔的电流/电压遥测转为稳定序列，电流与电压两通道独立过滤但共享分段边界。
