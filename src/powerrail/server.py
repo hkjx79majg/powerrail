@@ -19,6 +19,7 @@ TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
 TELEMETRY_AGGREGATE_ROUTE = "/v1/telemetry/aggregate"
 THERMAL_PROTECT_ROUTE = "/v1/battery/thermal/protect"
 BALANCE_PLAN_ROUTE = "/v1/battery/balance/plan"
+CHARGE_PLAN_ROUTE = "/v1/battery/charge/plan"
 PARALLEL_DISPATCH_ROUTE = "/v1/battery/packs/parallel/dispatch"
 SOLAR_HARVEST_ROUTE = "/v1/energy/solar/harvest/estimate"
 WIRELESS_NEGOTIATE_ROUTE = "/v1/power/wireless/negotiate"
@@ -62,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             TELEMETRY_AGGREGATE_ROUTE,
             THERMAL_PROTECT_ROUTE,
             BALANCE_PLAN_ROUTE,
+            CHARGE_PLAN_ROUTE,
             PARALLEL_DISPATCH_ROUTE,
             SOLAR_HARVEST_ROUTE,
             WIRELESS_NEGOTIATE_ROUTE,
@@ -98,6 +100,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.protect_thermal(payload)
             elif self.path == BALANCE_PLAN_ROUTE:
                 result = self.service.plan_balance(payload)
+            elif self.path == CHARGE_PLAN_ROUTE:
+                result = self.service.plan_charging(payload)
             elif self.path == PARALLEL_DISPATCH_ROUTE:
                 result = self.service.dispatch_parallel_packs(payload)
             elif self.path == SOLAR_HARVEST_ROUTE:
