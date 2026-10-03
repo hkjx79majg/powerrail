@@ -499,6 +499,319 @@ class Service:
             "allocations": allocations,
         }
 
+    LOAD_SHED_LEVELS = ("normal", "warning", "critical")
+
+    def decide_load_shedding(self, payload: Any) -> dict[str, Any]:
+        """Decide hysteresis load shedding across telemetry samples.
+
+        Each sample's raw shortfall is total demand plus reserve minus
+        available power, floored at zero. Reaching the critical or
+        warning threshold targets the ``critical`` or ``warning`` level,
+        anything lower targets ``normal``. The level starts at
+        ``normal``; escalation is immediate (a two-level jump counts as
+        one escalation), while de-escalation needs ``recovery_samples``
+        consecutive samples whose target is below the current level to
+        drop a single level, and any sample not below the current level
+        resets that streak. ``warning`` sheds loads marked ``warning``,
+        ``critical`` also sheds those marked ``critical``, and ``never``
+        loads are never shed. Remaining loads follow the power budget
+        rules; shed loads are allocated zero with state ``shed``.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        loads = payload.get("loads")
+        if not isinstance(loads, list) or not loads:
+            raise ApiError(422, "invalid_loads", "loads must be a non-empty array")
+        for load in loads:
+            if not isinstance(load, dict):
+                raise ApiError(422, "invalid_loads", "each load must be an object")
+
+        ids: list[str] = []
+        demands: list[float] = []
+        minimums: list[float] = []
+        priorities: list[int] = []
+        shed_levels: list[str] = []
+        seen_ids: set[str] = set()
+        for load in loads:
+            load_id = load.get("id")
+            if not isinstance(load_id, str) or not load_id:
+                raise ApiError(
+                    422, "invalid_load_id", "each load id must be a non-empty string"
+                )
+            if load_id in seen_ids:
+                raise ApiError(
+                    422, "invalid_load_id", f"load id {load_id!r} is duplicated"
+                )
+            seen_ids.add(load_id)
+            ids.append(load_id)
+
+            demand = load.get("demand_power_w")
+            minimum = load.get("min_power_w")
+            if not _is_finite_number(demand) or demand < 0:
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "demand_power_w must be a non-negative finite number",
+                )
+            if not _is_finite_number(minimum) or minimum < 0:
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "min_power_w must be a non-negative finite number",
+                )
+            if minimum > demand:
+                raise ApiError(
+                    422,
+                    "invalid_load_power",
+                    "min_power_w must not exceed demand_power_w",
+                )
+            demands.append(float(demand))
+            minimums.append(float(minimum))
+
+            priority = load.get("priority")
+            if (
+                not isinstance(priority, int)
+                or isinstance(priority, bool)
+                or not 0 <= priority <= 100
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_priority",
+                    "priority must be an integer within [0, 100]",
+                )
+            priorities.append(priority)
+
+            shed_level = load.get("shed_level")
+            if shed_level not in ("warning", "critical", "never"):
+                raise ApiError(
+                    422,
+                    "invalid_shed_level",
+                    "shed_level must be one of 'warning', 'critical' or 'never'",
+                )
+            shed_levels.append(shed_level)
+
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            raise ApiError(
+                422, "invalid_load_shed_config", "config must be an object"
+            )
+        reserve = config.get("reserve_power_w")
+        if not _is_finite_number(reserve) or reserve < 0:
+            raise ApiError(
+                422,
+                "invalid_load_shed_config",
+                "reserve_power_w must be a non-negative finite number",
+            )
+        warning_shortfall = config.get("warning_shortfall_w")
+        critical_shortfall = config.get("critical_shortfall_w")
+        if (
+            not _is_finite_number(warning_shortfall)
+            or not _is_finite_number(critical_shortfall)
+            or not 0 < warning_shortfall < critical_shortfall
+        ):
+            raise ApiError(
+                422,
+                "invalid_load_shed_config",
+                "thresholds must satisfy 0 < warning_shortfall_w < "
+                "critical_shortfall_w",
+            )
+        recovery_samples = config.get("recovery_samples")
+        if (
+            not isinstance(recovery_samples, int)
+            or isinstance(recovery_samples, bool)
+            or recovery_samples < 1
+        ):
+            raise ApiError(
+                422,
+                "invalid_load_shed_config",
+                "recovery_samples must be a positive integer",
+            )
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise ApiError(422, "invalid_samples", "samples must be a non-empty array")
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(
+                    422, "invalid_samples", "each sample must be an object"
+                )
+
+        timestamps: list[float] = []
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            timestamps.append(timestamp)
+            previous_timestamp = timestamp
+
+        availables: list[float] = []
+        for sample in samples:
+            available = sample.get("available_power_w")
+            if not _is_finite_number(available) or available < 0:
+                raise ApiError(
+                    422,
+                    "invalid_available_power",
+                    "available_power_w must be a non-negative finite number",
+                )
+            availables.append(float(available))
+
+        reserve = float(reserve)
+        total_demand = sum(demands)
+        level_names = self.LOAD_SHED_LEVELS
+        level = 0
+        recovery_streak = 0
+        escalation_count = 0
+
+        decisions: list[dict[str, Any]] = []
+        for index in range(len(samples)):
+            raw_shortfall = total_demand + reserve - availables[index]
+            if raw_shortfall < 0.0:
+                raw_shortfall = 0.0
+            if raw_shortfall >= critical_shortfall:
+                target = 2
+            elif raw_shortfall >= warning_shortfall:
+                target = 1
+            else:
+                target = 0
+
+            if target > level:
+                level = target
+                escalation_count += 1
+                recovery_streak = 0
+            elif target < level:
+                recovery_streak += 1
+                if recovery_streak >= recovery_samples:
+                    level -= 1
+                    recovery_streak = 0
+            else:
+                recovery_streak = 0
+
+            shed_flags = [
+                (level == 1 and shed_levels[position] == "warning")
+                or (level == 2 and shed_levels[position] in ("warning", "critical"))
+                for position in range(len(loads))
+            ]
+
+            distributable = availables[index] - reserve
+            if distributable < 0.0:
+                distributable = 0.0
+            active = [
+                position
+                for position in range(len(loads))
+                if not shed_flags[position]
+            ]
+            active_ids = [ids[position] for position in active]
+            active_allocated = [0.0] * len(active)
+            remaining = self._fund_levels(
+                [minimums[position] for position in active],
+                [priorities[position] for position in active],
+                active_ids,
+                active_allocated,
+                distributable,
+            )
+            self._fund_levels(
+                [demands[position] for position in active],
+                [priorities[position] for position in active],
+                active_ids,
+                active_allocated,
+                remaining,
+            )
+
+            allocated = [0.0] * len(loads)
+            for position, share in zip(active, active_allocated):
+                allocated[position] = share
+            for position in active:
+                if allocated[position] < 0.0:
+                    allocated[position] = 0.0
+                elif allocated[position] > demands[position]:
+                    allocated[position] = demands[position]
+            excess = sum(allocated) - distributable
+            if excess > 0.0:
+                for position in sorted(
+                    active, key=lambda i: (-allocated[i], ids[i])
+                ):
+                    if excess <= 0.0:
+                        break
+                    cut = min(allocated[position], excess)
+                    allocated[position] -= cut
+                    excess -= cut
+            total_allocated = sum(allocated)
+            unallocated = distributable - total_allocated
+            if unallocated < 0.0:
+                unallocated = 0.0
+
+            allocations: list[dict[str, Any]] = []
+            satisfied = True
+            for position in range(len(loads)):
+                if shed_flags[position]:
+                    allocations.append(
+                        {
+                            "id": ids[position],
+                            "allocated_power_w": 0.0,
+                            "shortfall_power_w": demands[position],
+                            "state": "shed",
+                        }
+                    )
+                    continue
+                shortfall = demands[position] - allocated[position]
+                if shortfall < 0.0:
+                    shortfall = 0.0
+                if demands[position] == 0.0 or allocated[position] >= demands[position]:
+                    state = "powered"
+                elif allocated[position] > 0.0:
+                    state = "limited"
+                    satisfied = False
+                else:
+                    state = "shed"
+                    satisfied = False
+                allocations.append(
+                    {
+                        "id": ids[position],
+                        "allocated_power_w": allocated[position],
+                        "shortfall_power_w": shortfall,
+                        "state": state,
+                    }
+                )
+
+            if all(shed_flags):
+                status = "policy_shed"
+            elif satisfied:
+                status = "satisfied"
+            else:
+                status = "constrained"
+
+            decisions.append(
+                {
+                    "timestamp_s": samples[index]["timestamp_s"],
+                    "raw_shortfall_w": raw_shortfall,
+                    "target_level": level_names[target],
+                    "level": level_names[level],
+                    "shed_ids": [
+                        ids[position]
+                        for position in range(len(loads))
+                        if shed_flags[position]
+                    ],
+                    "status": status,
+                    "allocated_power_w": total_allocated,
+                    "unallocated_power_w": unallocated,
+                    "allocations": allocations,
+                }
+            )
+
+        return {
+            "decisions": decisions,
+            "final_level": level_names[level],
+            "escalation_count": escalation_count,
+        }
+
     def filter_telemetry(self, payload: Any) -> dict[str, Any]:
         """Denoise current/voltage telemetry with segment-aware median + EMA."""
         if not isinstance(payload, dict):

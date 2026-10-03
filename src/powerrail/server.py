@@ -12,6 +12,7 @@ from .service import ApiError, Service
 SOC_ROUTE = "/v1/battery/soc/estimate"
 HEALTH_ROUTE = "/v1/battery/health/estimate"
 POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
+LOAD_SHED_ROUTE = "/v1/power/load-shed/decide"
 DCDC_EFFICIENCY_ROUTE = "/v1/power/dcdc/efficiency/estimate"
 LDO_EFFICIENCY_ROUTE = "/v1/power/ldo/efficiency/estimate"
 TELEMETRY_FILTER_ROUTE = "/v1/telemetry/filter"
@@ -54,6 +55,7 @@ class Handler(BaseHTTPRequestHandler):
             SOC_ROUTE,
             HEALTH_ROUTE,
             POWER_BUDGET_ROUTE,
+            LOAD_SHED_ROUTE,
             DCDC_EFFICIENCY_ROUTE,
             LDO_EFFICIENCY_ROUTE,
             TELEMETRY_FILTER_ROUTE,
@@ -86,6 +88,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.estimate_health(payload)
             elif self.path == POWER_BUDGET_ROUTE:
                 result = self.service.allocate_power_budget(payload)
+            elif self.path == LOAD_SHED_ROUTE:
+                result = self.service.decide_load_shedding(payload)
             elif self.path == DCDC_EFFICIENCY_ROUTE:
                 result = self.service.estimate_dcdc_efficiency(payload)
             elif self.path == LDO_EFFICIENCY_ROUTE:

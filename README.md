@@ -58,6 +58,22 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；预算字段非法或保留量超限为 `422 invalid_budget`；`loads` 数组或元素类型非法为 `422 invalid_loads`；`id` 缺失、为空或重复为 `422 invalid_load_id`；功率字段非法为 `422 invalid_load_power`；`priority` 缺失、为布尔值、非整数或越界为 `422 invalid_priority`。
 
+## 迟滞告警与分级降载
+
+`POST /v1/power/load-shed/decide`（也可直接调用 `Service.decide_load_shedding`）按可用功率样本序列执行带迟滞的分级降载决策，并对余下负载沿用功耗预算分配规则。
+
+请求字段：
+
+- `loads`（必填）：非空数组，每项含唯一非空字符串 `id`、非负有限数 `demand_power_w` 与 `min_power_w`（最低功率不得超过需求）、`[0, 100]` 内整数 `priority`，以及 `shed_level`（`warning`、`critical`、`never` 三选一）。
+- `config`（必填）：对象，含非负有限数 `reserve_power_w`、满足 `0 < warning_shortfall_w < critical_shortfall_w` 的有限数阈值，以及正整数 `recovery_samples`。
+- `samples`（必填）：非空数组，每项为对象，含严格递增的有限 `timestamp_s` 与非负有限 `available_power_w`；布尔值不作为数值接受。
+
+每项样本的原始缺口为总需求加保留功率减可用功率，下限取零；达到临界、告警阈值或更低时目标级别依次为 `critical`、`warning`、`normal`。级别从 `normal` 开始：目标高于当前级别时立即升级（跨两级仍计一次升级）；目标低于当前级别时，需连续 `recovery_samples` 项低于当前级别才降一级，否则连续计数清零，降级后重新计数。`warning` 级别切除 `shed_level` 为 `warning` 的负载，`critical` 级别再切除 `critical`，`never` 永不切除。余下负载以可用功率减保留功率（下限取零）按预算规则分配；被切除项分配为零且状态为 `shed`。
+
+响应 `decisions` 与样本等长同序，每项含 `timestamp_s`（原样保留）、`raw_shortfall_w`、`target_level`、`level`、`shed_ids`、`status`、`allocated_power_w`、`unallocated_power_w` 与 `allocations`（与负载同序，含 `id`、`allocated_power_w`、`shortfall_power_w`、`state`）；全部负载被策略切除时 `status` 为 `policy_shed`，余下需求全部满足为 `satisfied`，否则为 `constrained`。顶层含 `final_level` 与 `escalation_count`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`loads` 结构非法为 `422 invalid_loads`；`id` 非法或重复为 `422 invalid_load_id`；功率字段非法为 `422 invalid_load_power`；`priority` 非法为 `422 invalid_priority`；`shed_level` 非法为 `422 invalid_shed_level`；`config` 结构或字段非法为 `422 invalid_load_shed_config`；`samples` 结构非法为 `422 invalid_samples`；时间戳非法或未严格递增为 `422 invalid_timestamp`；可用功率非法为 `422 invalid_available_power`。
+
 ## DC-DC 效率评估
 
 `POST /v1/power/dcdc/efficiency/estimate`（也可直接调用 `Service.estimate_dcdc_efficiency`）按工况评估 DC-DC 转换器的效率、损耗与累计能量。
