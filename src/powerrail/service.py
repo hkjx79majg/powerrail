@@ -21,6 +21,7 @@ DEFAULT_SMOOTHING_FACTOR = 0.25
 DEFAULT_RESET_GAP_S = 30.0
 DEFAULT_REGRESSION_THRESHOLD_PERCENT = 5.0
 DEFAULT_TREND_THRESHOLD_W_PER_HOUR = 0.0
+DEFAULT_MIN_VOLTAGE_STEP_V = 0.000001
 
 
 class ApiError(Exception):
@@ -49,6 +50,42 @@ def _median(values: list[float]) -> float:
     if len(ordered) % 2 == 1:
         return float(ordered[middle])
     return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _weighted_isotonic_mean(
+    values: list[float], weights: list[float]
+) -> list[float]:
+    """Weighted isotonic (non-decreasing) regression via pool-adjacent-violators.
+
+    Each block tracks its weighted sum, total weight and member count; a
+    block whose mean exceeds the next block's mean merges with it. The
+    returned fit repeats each block mean across its members.
+    """
+    block_sums: list[float] = []
+    block_weights: list[float] = []
+    block_counts: list[int] = []
+    for value, weight in zip(values, weights):
+        block_sums.append(value * weight)
+        block_weights.append(weight)
+        block_counts.append(1)
+        while len(block_sums) >= 2:
+            previous_mean = block_sums[-2] / block_weights[-2]
+            current_mean = block_sums[-1] / block_weights[-1]
+            if previous_mean <= current_mean:
+                break
+            block_sums[-2] += block_sums[-1]
+            block_weights[-2] += block_weights[-1]
+            block_counts[-2] += block_counts[-1]
+            del block_sums[-1]
+            del block_weights[-1]
+            del block_counts[-1]
+    fitted: list[float] = []
+    for block_sum, block_weight, count in zip(
+        block_sums, block_weights, block_counts
+    ):
+        fitted.extend([block_sum / block_weight] * count)
+    return fitted
+
 
 
 def _interpolate_ocv(voltage: float, points: list[tuple[float, float]]) -> float:
@@ -342,6 +379,161 @@ class Service:
             "final_soc": estimates[-1]["soc"],
             "final_terminal_voltage_v": estimates[-1]["terminal_voltage_v"],
         }
+
+    def fit_ocv_curve(self, payload: Any) -> dict[str, Any]:
+        """Fit a strictly increasing SoC-keyed OCV curve from rest measurements.
+
+        Measurements sharing a SoC merge into one weighted-average knot. The
+        knot voltages minimize the weighted residual sum of squares subject
+        to every adjacent pair differing by at least ``min_voltage_step_v``;
+        this is weighted isotonic regression after shifting knot ``i`` by
+        ``i * step``. Fitted voltages for the original measurements follow
+        piecewise-linear interpolation on the knot SoCs.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        measurements = payload.get("measurements")
+        if not isinstance(measurements, list) or len(measurements) < 2:
+            raise ApiError(
+                422,
+                "invalid_measurements",
+                "measurements must be an array with at least two items",
+            )
+        for measurement in measurements:
+            if not isinstance(measurement, dict):
+                raise ApiError(
+                    422,
+                    "invalid_measurements",
+                    "each measurement must be an object",
+                )
+
+        for measurement in measurements:
+            soc = measurement.get("soc")
+            if not _is_finite_number(soc) or not 0 <= soc <= 1:
+                raise ApiError(
+                    422, "invalid_soc", "soc must be a finite number within [0, 1]"
+                )
+
+        measured_voltages: list[float] = []
+        for measurement in measurements:
+            voltage = measurement.get("voltage_v")
+            if not _is_finite_number(voltage):
+                raise ApiError(
+                    422, "invalid_voltage", "voltage_v must be a finite number"
+                )
+            measured_voltages.append(float(voltage))
+
+        weights: list[float] = []
+        for measurement in measurements:
+            weight = measurement.get("weight", 1.0)
+            if not _is_finite_number(weight) or weight <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_weight",
+                    "weight must be a positive finite number",
+                )
+            weights.append(float(weight))
+
+        min_step = self._parse_fit_options(payload.get("options"))
+
+        # Merge duplicate SoCs into a single weighted-mean knot, ascending.
+        merged: dict[float, list[float]] = {}
+        order: list[float] = []
+        for index, measurement in enumerate(measurements):
+            soc = float(measurement["soc"])
+            if soc not in merged:
+                merged[soc] = [0.0, 0.0, 0]
+                order.append(soc)
+            entry = merged[soc]
+            entry[0] += weights[index] * measured_voltages[index]
+            entry[1] += weights[index]
+            entry[2] += 1
+        order.sort()
+        if len(order) < 2:
+            raise ApiError(
+                422,
+                "insufficient_soc_span",
+                "measurements must cover at least two distinct soc values",
+            )
+
+        knot_socs = order
+        knot_weight_sums = [merged[soc][1] for soc in order]
+        knot_sample_counts = [merged[soc][2] for soc in order]
+        knot_means = [
+            merged[soc][0] / merged[soc][1] for soc in order
+        ]
+
+        # y_i = mean_i - i*step turns v_{i+1} - v_i >= step into a plain
+        # non-decreasing constraint; weighted PAVA yields the optimum.
+        shifted = [
+            knot_means[i] - i * min_step for i in range(len(knot_socs))
+        ]
+        fitted_shifted = _weighted_isotonic_mean(shifted, knot_weight_sums)
+        knot_voltages = [
+            fitted_shifted[i] + i * min_step for i in range(len(knot_socs))
+        ]
+
+        fitted_curve = [
+            {
+                "soc": knot_socs[i],
+                "voltage_v": knot_voltages[i],
+                "sample_count": knot_sample_counts[i],
+                "weight_sum": knot_weight_sums[i],
+            }
+            for i in range(len(knot_socs))
+        ]
+
+        curve_points = [
+            (knot_socs[i], knot_voltages[i]) for i in range(len(knot_socs))
+        ]
+        residuals: list[dict[str, Any]] = []
+        weighted_square_sum = 0.0
+        max_abs_error = 0.0
+        for index, measurement in enumerate(measurements):
+            soc = float(measurement["soc"])
+            fitted = _interpolate_model_ocv(soc, curve_points)
+            residual = measured_voltages[index] - fitted
+            residuals.append(
+                {
+                    "index": index,
+                    "soc": float(measurement["soc"]),
+                    "measured_voltage_v": measured_voltages[index],
+                    "fitted_voltage_v": fitted,
+                    "residual_voltage_v": residual,
+                }
+            )
+            weighted_square_sum += weights[index] * residual * residual
+            if abs(residual) > max_abs_error:
+                max_abs_error = abs(residual)
+
+        total_weight = sum(weights)
+        rmse = math.sqrt(weighted_square_sum / total_weight)
+
+        return {
+            "status": "fitted",
+            "curve": fitted_curve,
+            "residuals": residuals,
+            "rmse_voltage_v": rmse,
+            "max_abs_error_v": max_abs_error,
+            "measurement_count": len(measurements),
+            "knot_count": len(knot_socs),
+        }
+
+    @staticmethod
+    def _parse_fit_options(options: Any) -> float:
+        if options is None:
+            return DEFAULT_MIN_VOLTAGE_STEP_V
+        if not isinstance(options, dict):
+            raise ApiError(422, "invalid_fit_options", "options must be an object")
+        min_step = options.get("min_voltage_step_v", DEFAULT_MIN_VOLTAGE_STEP_V)
+        if not _is_finite_number(min_step) or min_step <= 0:
+            raise ApiError(
+                422,
+                "invalid_fit_options",
+                "min_voltage_step_v must be a positive finite number",
+            )
+        return float(min_step)
 
     def estimate_health(self, payload: Any) -> dict[str, Any]:
         """Estimate battery state of health and remaining cycle life."""

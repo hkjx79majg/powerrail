@@ -42,6 +42,21 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 响应 `estimates` 与样本等长同序，每项含 `timestamp_s`、`soc`、`ocv_voltage_v`、`polarization_voltage_v`、`terminal_voltage_v`；顶层 `final_soc`、`final_terminal_voltage_v` 取末项值，成功返回 `200` 且不修改请求对象。错误语义：`400 invalid_json`（请求体缺失、解析失败或顶层非对象）；`422` 依次为 `invalid_capacity`、`invalid_initial_soc`、`invalid_battery_model`、`invalid_ocv_curve`、`invalid_samples`、`invalid_timestamp`、`invalid_current`，布尔值不视为数值。
 
+## 静置 OCV 曲线拟合
+
+`POST /v1/battery/ocv/curve/fit`（也可直接调用 `Service.fit_ocv_curve`）把静置标定测量拟合成 SoC 为自变量、电压严格递增的可复用 OCV 曲线，曲线可原样作为 SoC 估算与 Thevenin 仿真的 `ocv_curve` 使用。
+
+请求字段：
+
+- `measurements`（必填）：至少两项的数组，每项为对象，含 `[0, 1]` 内有限数 `soc`、有限数 `voltage_v`，以及可省略的正有限数 `weight`（默认 `1`）；布尔值不视为数值，未知字段忽略。
+- `options`（可选）：对象，含正有限数 `min_voltage_step_v`，默认 `0.000001`；未知字段忽略。
+
+按 `soc` 升序合并重复 `soc` 为一个结点（电压取加权平均），在相邻结点电压差至少为 `min_voltage_step_v` 的约束下，使原始测量的 `weight × 电压残差平方和` 最小（加权单调回归：将结点 `i` 平移 `i × min_voltage_step_v` 后做加权保序回归再平移还原）；唯一 `soc` 不足两个时返回 `422 insufficient_soc_span`。
+
+响应 `curve` 中 `soc` 与 `voltage_v` 均严格递增，每项含 `soc`、`voltage_v`、`sample_count`（合并的测量数）、`weight_sum`。`residuals` 与输入测量同序，每项含 `index`、`soc`、`measured_voltage_v`、`fitted_voltage_v`、`residual_voltage_v`（测量值减拟合值，结点间按线性插值）。顶层返回加权 `rmse_voltage_v`、`max_abs_error_v`、`measurement_count`、`knot_count`，`status` 固定为 `fitted`，成功返回 `200`，且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`measurements` 非数组、少于两项或成员非对象为 `422 invalid_measurements`；`soc`、`voltage_v`、`weight` 非法分别为 `422 invalid_soc`、`invalid_voltage`、`invalid_weight`；`options` 非对象或 `min_voltage_step_v` 非法为 `422 invalid_fit_options`。
+
 ## 电池健康度与循环寿命估算
 
 `POST /v1/battery/health/estimate`（也可直接调用 `Service.estimate_health`）依据容量检测记录估算电池健康度（SoH）与剩余等效循环次数。
