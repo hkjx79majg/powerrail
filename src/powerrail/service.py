@@ -131,6 +131,78 @@ def _interpolate_dropout(
     return last_dropout  # pragma: no cover - unreachable for a sorted curve
 
 
+def _interpolate_cycle_life(
+    depth: float, points: list[tuple[float, float]]
+) -> float:
+    """Linearly interpolate cycles-to-EOL from a depth-sorted life curve.
+
+    Depths outside the curve resolve to the nearest endpoint.
+    """
+    first_depth, first_cycles = points[0]
+    last_depth, last_cycles = points[-1]
+    if depth <= first_depth:
+        return first_cycles
+    if depth >= last_depth:
+        return last_cycles
+    for (d0, c0), (d1, c1) in zip(points, points[1:]):
+        if depth <= d1:
+            ratio = (depth - d0) / (d1 - d0)
+            return c0 + ratio * (c1 - c0)
+    return last_cycles  # pragma: no cover - unreachable for a sorted curve
+
+
+def _turning_points(socs: list[float]) -> list[float]:
+    """Reduce a SoC series to endpoints and strict reversal points.
+
+    Adjacent equal values collapse first; afterwards every interior
+    point whose neighbours move in strictly opposite directions is a
+    reversal and is kept alongside the first and last values.
+    """
+    compressed: list[float] = []
+    for soc in socs:
+        if not compressed or soc != compressed[-1]:
+            compressed.append(soc)
+    if len(compressed) <= 2:
+        return compressed
+    points = [compressed[0]]
+    for index in range(1, len(compressed) - 1):
+        rise_in = compressed[index] - compressed[index - 1]
+        rise_out = compressed[index + 1] - compressed[index]
+        if rise_in * rise_out < 0.0:
+            points.append(compressed[index])
+    points.append(compressed[-1])
+    return points
+
+
+def _rainflow_cycles(points: list[float]) -> list[tuple[float, float]]:
+    """Count cycles in a turning-point series per ASTM E1049.
+
+    Closed cycles count 1; each range left in the final residue counts
+    0.5. Returns ``(depth, count)`` pairs in identification order.
+    """
+    stack: list[float] = []
+    cycles: list[tuple[float, float]] = []
+    for point in points:
+        stack.append(point)
+        while len(stack) >= 3:
+            inner = abs(stack[-2] - stack[-3])
+            outer = abs(stack[-1] - stack[-2])
+            if outer < inner:
+                break
+            if len(stack) == 3:
+                cycles.append((inner, 0.5))
+                stack.pop(0)
+            else:
+                cycles.append((inner, 1.0))
+                last = stack.pop()
+                stack.pop()
+                stack.pop()
+                stack.append(last)
+    for first, second in zip(stack, stack[1:]):
+        cycles.append((abs(second - first), 0.5))
+    return cycles
+
+
 class Service:
     """Stateless service surface: health reporting and SoC estimation."""
 
@@ -793,6 +865,99 @@ class Service:
             "consumed_cycles": consumed_cycles,
             "remaining_cycles": remaining_cycles,
             "projection_status": projection_status,
+        }
+
+    def analyze_battery_cycles(self, payload: Any) -> dict[str, Any]:
+        """Rainflow-count partial SoC cycles and score cycle aging.
+
+        Adjacent equal SoC values collapse, then only the endpoints and
+        strict reversal points remain. ASTM E1049 rainflow counting
+        closes full cycles (count 1) and leaves residual ranges (count
+        0.5); each cycle's depth is its SoC range. Cycles strictly
+        shallower than ``min_cycle_depth`` are ignored; the rest look up
+        ``cycles_to_eol`` on the life curve (linear interpolation,
+        clamped to the nearest endpoint) and contribute
+        ``count / cycles_to_eol`` damage.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        samples = payload.get("samples")
+        if not isinstance(samples, list) or len(samples) < 2:
+            raise ApiError(
+                422,
+                "invalid_samples",
+                "samples must be an array with at least two items",
+            )
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ApiError(
+                    422, "invalid_samples", "each sample must be an object"
+                )
+
+        previous_timestamp: float | None = None
+        for sample in samples:
+            timestamp = sample.get("timestamp_s")
+            if not _is_finite_number(timestamp):
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be a finite number"
+                )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ApiError(
+                    422, "invalid_timestamp", "timestamp_s must be strictly increasing"
+                )
+            previous_timestamp = timestamp
+
+        socs: list[float] = []
+        for sample in samples:
+            soc = sample.get("soc")
+            if not _is_finite_number(soc) or not 0 <= soc <= 1:
+                raise ApiError(
+                    422, "invalid_soc", "soc must be a finite number within [0, 1]"
+                )
+            socs.append(float(soc))
+
+        life_curve = self._parse_cycle_life_curve(payload.get("cycle_life_curve"))
+
+        min_cycle_depth = payload.get("min_cycle_depth", 0.0)
+        if not _is_finite_number(min_cycle_depth) or not 0 <= min_cycle_depth <= 1:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "min_cycle_depth must be a finite number within [0, 1]",
+            )
+        min_cycle_depth = float(min_cycle_depth)
+
+        counted = _rainflow_cycles(_turning_points(socs))
+
+        cycles: list[dict[str, Any]] = []
+        cycle_count = 0.0
+        equivalent_full_cycles = 0.0
+        total_damage = 0.0
+        for depth, count in counted:
+            if depth < min_cycle_depth:
+                continue
+            cycles_to_eol = _interpolate_cycle_life(depth, life_curve)
+            damage = count / cycles_to_eol
+            cycles.append(
+                {
+                    "depth": depth,
+                    "count": count,
+                    "cycles_to_eol": cycles_to_eol,
+                    "damage": damage,
+                }
+            )
+            cycle_count += count
+            equivalent_full_cycles += depth * count
+            total_damage += damage
+
+        return {
+            "cycles": cycles,
+            "cycle_count": cycle_count,
+            "equivalent_full_cycles": equivalent_full_cycles,
+            "total_damage": total_damage,
+            "remaining_life_ratio": max(0.0, 1.0 - total_damage),
+            "status": "exhausted" if total_damage >= 1.0 else "active",
         }
 
     def allocate_power_budget(self, payload: Any) -> dict[str, Any]:
@@ -3699,6 +3864,57 @@ class Service:
             points.append((voltage, soc))
             previous_voltage = voltage
             previous_soc = soc
+        return points
+
+    @staticmethod
+    def _parse_cycle_life_curve(curve: Any) -> list[tuple[float, float]]:
+        if not isinstance(curve, list) or len(curve) < 2:
+            raise ApiError(
+                422,
+                "invalid_cycle_life_curve",
+                "cycle_life_curve must contain at least two points",
+            )
+        points: list[tuple[float, float]] = []
+        previous_depth: float | None = None
+        previous_cycles: float | None = None
+        for point in curve:
+            if not isinstance(point, dict):
+                raise ApiError(
+                    422,
+                    "invalid_cycle_life_curve",
+                    "each cycle life curve point must be an object",
+                )
+            depth = point.get("depth")
+            cycles_to_eol = point.get("cycles_to_eol")
+            if not _is_finite_number(depth) or not 0 < depth <= 1:
+                raise ApiError(
+                    422,
+                    "invalid_cycle_life_curve",
+                    "cycle life curve depth must be a finite number within (0, 1]",
+                )
+            if not _is_finite_number(cycles_to_eol) or cycles_to_eol <= 0:
+                raise ApiError(
+                    422,
+                    "invalid_cycle_life_curve",
+                    "cycle life curve cycles_to_eol must be a positive finite "
+                    "number",
+                )
+            if previous_depth is not None:
+                if depth <= previous_depth:
+                    raise ApiError(
+                        422,
+                        "invalid_cycle_life_curve",
+                        "cycle life curve depth must be strictly increasing",
+                    )
+                if cycles_to_eol > previous_cycles:
+                    raise ApiError(
+                        422,
+                        "invalid_cycle_life_curve",
+                        "cycle life curve cycles_to_eol must be non-increasing",
+                    )
+            points.append((float(depth), float(cycles_to_eol)))
+            previous_depth = depth
+            previous_cycles = cycles_to_eol
         return points
 
     @staticmethod
