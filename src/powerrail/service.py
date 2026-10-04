@@ -22,6 +22,7 @@ DEFAULT_RESET_GAP_S = 30.0
 DEFAULT_REGRESSION_THRESHOLD_PERCENT = 5.0
 DEFAULT_TREND_THRESHOLD_W_PER_HOUR = 0.0
 DEFAULT_MIN_VOLTAGE_STEP_V = 0.000001
+DEFAULT_MIN_CURRENT_STEP_A = 0.1
 
 
 class ApiError(Exception):
@@ -342,6 +343,176 @@ class Service:
             "estimates": estimates,
             "final_soc": estimates[-1]["soc"],
             "final_terminal_voltage_v": estimates[-1]["terminal_voltage_v"],
+        }
+
+    def estimate_internal_resistance(self, payload: Any) -> dict[str, Any]:
+        """Fit a SoC-keyed ohmic internal-resistance curve from current pulses.
+
+        Each pulse reports the terminal voltage response to a current
+        step; its single-pulse resistance is ``-delta_voltage_v /
+        delta_current_a``. Pulses sharing a SoC merge into one knot via a
+        weight-weighted mean, and every pulse is scored against the
+        resistance of the knot it belongs to.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        pulses = payload.get("pulses")
+        if not isinstance(pulses, list) or not pulses:
+            raise ApiError(422, "invalid_pulses", "pulses must be a non-empty array")
+        for pulse in pulses:
+            if not isinstance(pulse, dict):
+                raise ApiError(422, "invalid_pulses", "each pulse must be an object")
+
+        socs: list[float] = []
+        for pulse in pulses:
+            soc = pulse.get("soc")
+            if not _is_finite_number(soc) or not 0 <= soc <= 1:
+                raise ApiError(
+                    422, "invalid_soc", "soc must be a finite number within [0, 1]"
+                )
+            socs.append(float(soc))
+
+        current_before: list[float] = []
+        current_after: list[float] = []
+        for pulse in pulses:
+            before = pulse.get("current_before_a")
+            after = pulse.get("current_after_a")
+            if not _is_finite_number(before) or not _is_finite_number(after):
+                raise ApiError(
+                    422,
+                    "invalid_current",
+                    "current_before_a and current_after_a must be finite numbers",
+                )
+            current_before.append(float(before))
+            current_after.append(float(after))
+
+        voltage_before: list[float] = []
+        voltage_after: list[float] = []
+        for pulse in pulses:
+            before = pulse.get("voltage_before_v")
+            after = pulse.get("voltage_after_v")
+            if (
+                not _is_finite_number(before)
+                or before <= 0
+                or not _is_finite_number(after)
+                or after <= 0
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_voltage",
+                    "voltage_before_v and voltage_after_v must be positive "
+                    "finite numbers",
+                )
+            voltage_before.append(float(before))
+            voltage_after.append(float(after))
+
+        weights: list[float] = []
+        for pulse in pulses:
+            weight = pulse.get("weight", 1.0)
+            if not _is_finite_number(weight) or weight <= 0:
+                raise ApiError(
+                    422, "invalid_weight", "weight must be a positive finite number"
+                )
+            weights.append(float(weight))
+
+        min_current_step = payload.get(
+            "min_current_step_a", DEFAULT_MIN_CURRENT_STEP_A
+        )
+        if not _is_finite_number(min_current_step) or min_current_step <= 0:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "min_current_step_a must be a positive finite number",
+            )
+        min_current_step = float(min_current_step)
+
+        delta_currents = [
+            current_after[index] - current_before[index]
+            for index in range(len(pulses))
+        ]
+        delta_voltages = [
+            voltage_after[index] - voltage_before[index]
+            for index in range(len(pulses))
+        ]
+        for index in range(len(pulses)):
+            if abs(delta_currents[index]) < min_current_step:
+                raise ApiError(
+                    422,
+                    "invalid_current_step",
+                    "current step magnitude must reach min_current_step_a",
+                )
+            if delta_currents[index] * delta_voltages[index] >= 0.0:
+                raise ApiError(
+                    422,
+                    "invalid_pulse_response",
+                    "voltage change must oppose current change",
+                )
+
+        knot_weight_sums: dict[float, float] = {}
+        knot_resistance_sums: dict[float, float] = {}
+        knot_pulse_counts: dict[float, int] = {}
+        resistances: list[float] = []
+        for index, soc in enumerate(socs):
+            resistance = -delta_voltages[index] / delta_currents[index]
+            resistances.append(resistance)
+            knot_weight_sums[soc] = knot_weight_sums.get(soc, 0.0) + weights[index]
+            knot_resistance_sums[soc] = (
+                knot_resistance_sums.get(soc, 0.0) + weights[index] * resistance
+            )
+            knot_pulse_counts[soc] = knot_pulse_counts.get(soc, 0) + 1
+
+        unique_socs = sorted(knot_weight_sums)
+        if len(unique_socs) < 2:
+            raise ApiError(
+                422,
+                "insufficient_soc_span",
+                "pulses must cover at least two distinct soc values",
+            )
+
+        knot_resistances = {
+            soc: knot_resistance_sums[soc] / knot_weight_sums[soc]
+            for soc in unique_socs
+        }
+
+        pulse_estimates: list[dict[str, Any]] = []
+        weighted_error_sum = 0.0
+        weight_total = 0.0
+        for index in range(len(pulses)):
+            fitted_voltage_change = (
+                -delta_currents[index] * knot_resistances[socs[index]]
+            )
+            residual = delta_voltages[index] - fitted_voltage_change
+            weighted_error_sum += weights[index] * residual * residual
+            weight_total += weights[index]
+            pulse_estimates.append(
+                {
+                    "index": index,
+                    "soc": pulses[index]["soc"],
+                    "delta_current_a": delta_currents[index],
+                    "delta_voltage_v": delta_voltages[index],
+                    "resistance_ohm": resistances[index],
+                    "fitted_voltage_change_v": fitted_voltage_change,
+                    "residual_voltage_v": residual,
+                }
+            )
+
+        curve = [
+            {
+                "soc": soc,
+                "resistance_ohm": knot_resistances[soc],
+                "pulse_count": knot_pulse_counts[soc],
+                "weight_sum": knot_weight_sums[soc],
+            }
+            for soc in unique_socs
+        ]
+
+        return {
+            "status": "fitted",
+            "curve": curve,
+            "pulse_estimates": pulse_estimates,
+            "recommended_r0_ohm": max(knot_resistances[soc] for soc in unique_socs),
+            "rmse_voltage_v": math.sqrt(weighted_error_sum / weight_total),
         }
 
     def fit_ocv_curve(self, payload: Any) -> dict[str, Any]:

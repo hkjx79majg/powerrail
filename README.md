@@ -42,6 +42,24 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 响应 `estimates` 与样本等长同序，每项含 `timestamp_s`、`soc`、`ocv_voltage_v`、`polarization_voltage_v`、`terminal_voltage_v`；顶层 `final_soc`、`final_terminal_voltage_v` 取末项值，成功返回 `200` 且不修改请求对象。错误语义：`400 invalid_json`（请求体缺失、解析失败或顶层非对象）；`422` 依次为 `invalid_capacity`、`invalid_initial_soc`、`invalid_battery_model`、`invalid_ocv_curve`、`invalid_samples`、`invalid_timestamp`、`invalid_current`，布尔值不视为数值。
 
+## 欧姆内阻曲线拟合
+
+`POST /v1/battery/resistance/estimate`（也可直接调用 `Service.estimate_internal_resistance`）把电流阶跃及其端电压响应拟合成随 SoC 变化的欧姆内阻曲线，结果中的 `recommended_r0_ohm` 可作为一阶 Thevenin 模型仿真的 `r0_ohm`。
+请求字段：
+
+- `pulses`（必填）：非空数组，每项为对象，含：
+  - `soc`：`[0, 1]` 内有限数；
+  - `current_before_a`、`current_after_a`：阶跃前后的有限电流（安）；
+  - `voltage_before_v`、`voltage_after_v`：阶跃前后的正有限端电压（伏）；
+  - `weight`（可选）：正有限数权重，默认 `1`；布尔值不视为数值。
+- `min_current_step_a`（可选）：正有限数最小电流阶跃阈值，默认 `0.1`。
+
+电流、电压变化量均为后值减前值：`delta_current_a = current_after_a - current_before_a`，`delta_voltage_v = voltage_after_v - voltage_before_v`。电流变化绝对值必须不低于 `min_current_step_a`，且电流与电压变化量乘积必须严格小于零（方向相反）。单次脉冲内阻为 `resistance_ohm = -delta_voltage_v / delta_current_a`。相同 `soc` 的脉冲按 `weight` 加权平均成一个结点，且结点至少覆盖两个不同 `soc`。
+
+响应 `curve` 按 `soc` 升序，每个结点含 `soc`、`resistance_ohm`、`pulse_count`、`weight_sum`；`pulse_estimates` 与输入等长同序，逐项含 `index`、`soc`、`delta_current_a`、`delta_voltage_v`、`resistance_ohm`（单次内阻）、`fitted_voltage_change_v`（以所属结点内阻计算的 `-delta_current_a * resistance_ohm`）和 `residual_voltage_v`（实际电压变化量减拟合值）。顶层含 `recommended_r0_ohm`（最大结点内阻）、加权 `rmse_voltage_v`（以各脉冲权重计算的残差均方根）与 `status`（固定为 `fitted`）。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`pulses` 结构非法为 `422 invalid_pulses`；`soc`、电流、电压、`weight` 非法分别为 `422 invalid_soc`、`invalid_current`、`invalid_voltage`、`invalid_weight`；`min_current_step_a` 非法为 `422 invalid_options`；电流阶跃不足为 `422 invalid_current_step`；电压响应方向错误（乘积非负）为 `422 invalid_pulse_response`；唯一 `soc` 不足两个为 `422 insufficient_soc_span`。
+
 ## OCV 曲线拟合
 
 `POST /v1/battery/ocv/curve/fit`（也可直接调用 `Service.fit_ocv_curve`）把静置标定测量拟合成可复用的单调 OCV 曲线，结果可原样作为 SoC 估算与 Thevenin 仿真的 `ocv_curve`。

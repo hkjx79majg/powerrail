@@ -11,6 +11,7 @@ from .service import ApiError, Service
 
 SOC_ROUTE = "/v1/battery/soc/estimate"
 BATTERY_MODEL_ROUTE = "/v1/battery/model/simulate"
+BATTERY_RESISTANCE_ROUTE = "/v1/battery/resistance/estimate"
 OCV_CURVE_FIT_ROUTE = "/v1/battery/ocv/curve/fit"
 HEALTH_ROUTE = "/v1/battery/health/estimate"
 POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
@@ -58,6 +59,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in (
             SOC_ROUTE,
             BATTERY_MODEL_ROUTE,
+            BATTERY_RESISTANCE_ROUTE,
             OCV_CURVE_FIT_ROUTE,
             HEALTH_ROUTE,
             POWER_BUDGET_ROUTE,
@@ -94,6 +96,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.estimate_soc(payload)
             elif self.path == BATTERY_MODEL_ROUTE:
                 result = self.service.simulate_battery_model(payload)
+            elif self.path == BATTERY_RESISTANCE_ROUTE:
+                result = self.service.estimate_internal_resistance(payload)
             elif self.path == OCV_CURVE_FIT_ROUTE:
                 result = self.service.fit_ocv_curve(payload)
             elif self.path == HEALTH_ROUTE:
