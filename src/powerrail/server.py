@@ -14,6 +14,7 @@ BATTERY_MODEL_ROUTE = "/v1/battery/model/simulate"
 BATTERY_RESISTANCE_ROUTE = "/v1/battery/resistance/estimate"
 OCV_CURVE_FIT_ROUTE = "/v1/battery/ocv/curve/fit"
 HEALTH_ROUTE = "/v1/battery/health/estimate"
+BATTERY_CYCLES_ROUTE = "/v1/battery/cycles/analyze"
 POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
 LOAD_SHED_ROUTE = "/v1/power/load-shed/decide"
 DCDC_EFFICIENCY_ROUTE = "/v1/power/dcdc/efficiency/estimate"
@@ -62,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             BATTERY_RESISTANCE_ROUTE,
             OCV_CURVE_FIT_ROUTE,
             HEALTH_ROUTE,
+            BATTERY_CYCLES_ROUTE,
             POWER_BUDGET_ROUTE,
             LOAD_SHED_ROUTE,
             DCDC_EFFICIENCY_ROUTE,
@@ -102,6 +104,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.fit_ocv_curve(payload)
             elif self.path == HEALTH_ROUTE:
                 result = self.service.estimate_health(payload)
+            elif self.path == BATTERY_CYCLES_ROUTE:
+                result = self.service.analyze_battery_cycles(payload)
             elif self.path == POWER_BUDGET_ROUTE:
                 result = self.service.allocate_power_budget(payload)
             elif self.path == LOAD_SHED_ROUTE:

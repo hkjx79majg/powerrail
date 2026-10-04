@@ -89,6 +89,23 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`422` 字段错误包括 `invalid_nominal_capacity`、`invalid_measurements`（数组类型、数量或元素类型非法）、`invalid_timestamp`、`invalid_capacity_measurement`、`invalid_throughput`（累计放电量缺失、非有限、为负或下降）、`invalid_end_of_life_soh`。
 
+## 部分循环老化分析
+
+`POST /v1/battery/cycles/analyze`（也可直接调用 `Service.analyze_battery_cycles`）依据 SoC 历史序列做雨流计数，并结合深度-寿命曲线估算部分循环老化。
+
+请求字段：
+
+- `samples`（必填）：至少两项的数组，每项为对象，含有限的 `timestamp_s`（严格递增）与位于 `[0,1]` 的有限数 `soc`；布尔值不作为数值接受。
+- `cycle_life_curve`（必填）：至少两个结点的数组，每项为对象，`depth` 位于 `(0,1]` 且严格递增，`cycles_to_eol` 为正有限数并随深度单调不增。
+- `min_cycle_depth`（可选）：位于 `[0,1]` 的有限数，默认 `0`。
+
+先压缩相邻相同 SoC，只保留首项、末项和严格反转点（严格局部峰、谷），再按 ASTM E1049 雨流法计数：闭合循环计数为 `1`，最终残留中的范围各计数 `0.5`，循环深度取 SoC 范围。严格小于 `min_cycle_depth` 的循环忽略；其余按深度在寿命曲线上线性插值得到 `cycles_to_eol`，越界取最近端点，`damage = count / cycles_to_eol`。
+
+响应 `cycles` 按识别顺序排列，每项含 `depth`、`count`、`cycles_to_eol`、`damage`；`cycle_count` 为 `count` 之和，`equivalent_full_cycles` 为 `depth × count` 之和，`total_damage` 为 `damage` 之和，`remaining_life_ratio` 为 `max(0, 1 - total_damage)`。`total_damage` 达到 `1` 时 `status` 为 `exhausted`，否则为 `active`；无可计循环时 `cycles` 为空且各汇总值为 `0`。成功返回 `200`，且不修改请求对象。
+
+错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`samples` 结构非法为 `422 invalid_samples`；时间戳非法为 `422 invalid_timestamp`；`soc` 非法为 `422 invalid_soc`；寿命曲线非法为 `422 invalid_cycle_life_curve`；`min_cycle_depth` 非法为 `422 invalid_options`。
+
+
 ## 功耗预算分配
 
 `POST /v1/power/budget/allocate`（也可直接调用 `Service.allocate_power_budget`）在可用功率约束下按优先级为负载分配功率。
