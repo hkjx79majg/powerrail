@@ -54,6 +54,25 @@ PYTHONPATH=src python3 -m powerrail.server --host 127.0.0.1 --port 8080
 
 错误响应沿用统一结构：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`measurements` 结构非法为 `422 invalid_measurements`；`soc`、`voltage_v`、`weight` 非法分别为 `422 invalid_soc`、`invalid_voltage`、`invalid_weight`；`options` 结构或 `min_voltage_step_v` 非法为 `422 invalid_fit_options`；仅有一个唯一 `soc` 为 `422 insufficient_soc_span`。
 
+## 电池欧姆内阻曲线识别
+
+`POST /v1/battery/resistance/estimate`（也可直接调用 `Service.estimate_internal_resistance`）把电流阶跃及其端电压响应拟合成随 SoC 变化的欧姆内阻曲线，供一阶 Thevenin 仿真选取 `r0_ohm`。
+请求字段：
+
+- `pulses`（必填）：非空数组，每项为对象，含：
+  - `soc`：`[0, 1]` 内有限数；
+  - `current_before_a`、`current_after_a`：阶跃前后电流的有限数（正电流放电、负电流充电）；
+  - `voltage_before_v`、`voltage_after_v`：阶跃前后端电压的正有限数；
+  - `weight`（可选）：正有限数权重，默认 `1`。
+  - 布尔值不视为数值。
+- `options`（可选）：对象，含正有限数 `min_current_step_a`（默认 `0.1`）；未知字段忽略，请求对象不被修改。
+
+各变化量均为后值减前值：`delta_i = current_after_a - current_before_a`、`delta_v = voltage_after_v - voltage_before_v`。仅当 `abs(delta_i)` 不低于 `min_current_step_a`，且 `delta_i * delta_v < 0`（放电阶跃电压下降、充电阶跃电压上升）时脉冲有效；单次内阻为 `r = -delta_v / delta_i`。相同 `soc` 的脉冲按 `weight` 加权平均合并成一个结点，且全部脉冲至少覆盖两个不同 `soc`。
+
+结点按 `soc` 升序组成 `curve`，每项含 `soc`、`resistance_ohm`、`pulse_count`、`weight_sum`；`recommended_r0_ohm` 取最大结点内阻。`pulse_estimates` 与输入等长同序，每项含 `index`、`soc`、`current_change_a`、`voltage_change_v`、`resistance_ohm`（单次内阻）、`fitted_voltage_change_v`（所属结点内阻应用于该脉冲电流变化量：`-resistance_ohm * current_change_a`）与 `residual_voltage_v`（实际电压变化量减拟合值）。`rmse_voltage_v` 为按 `weight` 加权的残差均方根。顶层 `status` 固定为 `fitted`，成功返回 `200`。
+
+错误响应沿用 `{"error":{"code":...,"message":...}}`：请求体缺失、JSON 解析失败或顶层非对象为 `400 invalid_json`；`pulses` 结构非法为 `422 invalid_pulses`；`soc`、电流、电压、`weight` 非法分别为 `422 invalid_soc`、`invalid_current`、`invalid_voltage`、`invalid_weight`；`options` 结构或 `min_current_step_a` 非法为 `422 invalid_options`；阶跃幅度低于阈值为 `422 invalid_current_step`；电压响应与电流变化同号（含电压零变化）为 `422 invalid_pulse_response`；仅有一个唯一 `soc` 为 `422 insufficient_soc_span`。
+
 ## 电池健康度与循环寿命估算
 
 `POST /v1/battery/health/estimate`（也可直接调用 `Service.estimate_health`）依据容量检测记录估算电池健康度（SoH）与剩余等效循环次数。

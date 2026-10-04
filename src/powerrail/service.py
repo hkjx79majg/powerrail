@@ -22,6 +22,7 @@ DEFAULT_RESET_GAP_S = 30.0
 DEFAULT_REGRESSION_THRESHOLD_PERCENT = 5.0
 DEFAULT_TREND_THRESHOLD_W_PER_HOUR = 0.0
 DEFAULT_MIN_VOLTAGE_STEP_V = 0.000001
+DEFAULT_MIN_CURRENT_STEP_A = 0.1
 
 
 class ApiError(Exception):
@@ -494,6 +495,176 @@ class Service:
             "max_abs_error_v": max_abs_error,
             "measurement_count": len(measurements),
             "knot_count": knot_total,
+        }
+
+    def estimate_internal_resistance(self, payload: Any) -> dict[str, Any]:
+        """Fit a SoC-keyed ohmic internal resistance curve from current pulses.
+
+        Each pulse records the current and terminal voltage immediately
+        before and after a step; changes are after minus before. A pulse
+        is usable only when the current step magnitude reaches
+        ``min_current_step_a`` and the current and voltage changes have
+        opposite signs (terminal voltage drops on discharge, rises on
+        charge), giving ``r = -delta_v / delta_i``. Pulses sharing a SoC
+        merge into one knot holding the weight-weighted mean resistance.
+        The fitted voltage change of every pulse is the resistance of
+        its knot applied to its own current change; residuals feed the
+        weighted RMSE.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        pulses = payload.get("pulses")
+        if not isinstance(pulses, list) or not pulses:
+            raise ApiError(
+                422, "invalid_pulses", "pulses must be a non-empty array"
+            )
+        for pulse in pulses:
+            if not isinstance(pulse, dict):
+                raise ApiError(
+                    422, "invalid_pulses", "each pulse must be an object"
+                )
+
+        socs: list[float] = []
+        for pulse in pulses:
+            soc = pulse.get("soc")
+            if not _is_finite_number(soc) or not 0 <= soc <= 1:
+                raise ApiError(
+                    422, "invalid_soc", "soc must be a finite number within [0, 1]"
+                )
+            socs.append(float(soc))
+
+        currents_before: list[float] = []
+        currents_after: list[float] = []
+        for pulse in pulses:
+            current_before = pulse.get("current_before_a")
+            current_after = pulse.get("current_after_a")
+            if not _is_finite_number(current_before) or not _is_finite_number(
+                current_after
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_current",
+                    "current_before_a and current_after_a must be finite numbers",
+                )
+            currents_before.append(float(current_before))
+            currents_after.append(float(current_after))
+
+        voltages_before: list[float] = []
+        voltages_after: list[float] = []
+        for pulse in pulses:
+            voltage_before = pulse.get("voltage_before_v")
+            voltage_after = pulse.get("voltage_after_v")
+            if (
+                not _is_finite_number(voltage_before)
+                or voltage_before <= 0
+                or not _is_finite_number(voltage_after)
+                or voltage_after <= 0
+            ):
+                raise ApiError(
+                    422,
+                    "invalid_voltage",
+                    "voltage_before_v and voltage_after_v must be positive "
+                    "finite numbers",
+                )
+            voltages_before.append(float(voltage_before))
+            voltages_after.append(float(voltage_after))
+
+        weights: list[float] = []
+        for pulse in pulses:
+            weight = pulse.get("weight", 1.0)
+            if not _is_finite_number(weight) or weight <= 0:
+                raise ApiError(
+                    422, "invalid_weight", "weight must be a positive finite number"
+                )
+            weights.append(float(weight))
+
+        min_current_step = self._parse_resistance_options(payload.get("options"))
+
+        resistances: list[float] = []
+        delta_currents: list[float] = []
+        delta_voltages: list[float] = []
+        for index in range(len(pulses)):
+            delta_current = currents_after[index] - currents_before[index]
+            delta_voltage = voltages_after[index] - voltages_before[index]
+            if abs(delta_current) < min_current_step:
+                raise ApiError(
+                    422,
+                    "invalid_current_step",
+                    "abs(current_after_a - current_before_a) must be at least "
+                    "min_current_step_a",
+                )
+            if delta_current * delta_voltage >= 0.0:
+                raise ApiError(
+                    422,
+                    "invalid_pulse_response",
+                    "current and voltage changes must have opposite signs",
+                )
+            delta_currents.append(delta_current)
+            delta_voltages.append(delta_voltage)
+            resistances.append(-delta_voltage / delta_current)
+
+        knot_weight_sums: dict[float, float] = {}
+        knot_resistance_sums: dict[float, float] = {}
+        knot_pulse_counts: dict[float, int] = {}
+        for soc, resistance, weight in zip(socs, resistances, weights):
+            knot_weight_sums[soc] = knot_weight_sums.get(soc, 0.0) + weight
+            knot_resistance_sums[soc] = (
+                knot_resistance_sums.get(soc, 0.0) + weight * resistance
+            )
+            knot_pulse_counts[soc] = knot_pulse_counts.get(soc, 0) + 1
+
+        unique_socs = sorted(knot_weight_sums)
+        if len(unique_socs) < 2:
+            raise ApiError(
+                422,
+                "insufficient_soc_span",
+                "pulses must cover at least two distinct soc values",
+            )
+
+        knot_resistances = {
+            soc: knot_resistance_sums[soc] / knot_weight_sums[soc]
+            for soc in unique_socs
+        }
+
+        pulse_estimates: list[dict[str, Any]] = []
+        weighted_error_sum = 0.0
+        weight_total = 0.0
+        for index in range(len(pulses)):
+            fitted_delta_voltage = (
+                -knot_resistances[socs[index]] * delta_currents[index]
+            )
+            residual = delta_voltages[index] - fitted_delta_voltage
+            weighted_error_sum += weights[index] * residual * residual
+            weight_total += weights[index]
+            pulse_estimates.append(
+                {
+                    "index": index,
+                    "soc": pulses[index]["soc"],
+                    "current_change_a": delta_currents[index],
+                    "voltage_change_v": delta_voltages[index],
+                    "resistance_ohm": resistances[index],
+                    "fitted_voltage_change_v": fitted_delta_voltage,
+                    "residual_voltage_v": residual,
+                }
+            )
+
+        curve = [
+            {
+                "soc": soc,
+                "resistance_ohm": knot_resistances[soc],
+                "pulse_count": knot_pulse_counts[soc],
+                "weight_sum": knot_weight_sums[soc],
+            }
+            for soc in unique_socs
+        ]
+
+        return {
+            "status": "fitted",
+            "curve": curve,
+            "pulse_estimates": pulse_estimates,
+            "recommended_r0_ohm": max(knot_resistances[soc] for soc in unique_socs),
+            "rmse_voltage_v": math.sqrt(weighted_error_sum / weight_total),
         }
 
     def estimate_health(self, payload: Any) -> dict[str, Any]:
@@ -3415,6 +3586,23 @@ class Service:
                 "min_voltage_step_v must be a positive finite number",
             )
         return float(min_voltage_step)
+
+    @staticmethod
+    def _parse_resistance_options(options: Any) -> float:
+        if options is None:
+            return DEFAULT_MIN_CURRENT_STEP_A
+        if not isinstance(options, dict):
+            raise ApiError(422, "invalid_options", "options must be an object")
+        min_current_step = options.get(
+            "min_current_step_a", DEFAULT_MIN_CURRENT_STEP_A
+        )
+        if not _is_finite_number(min_current_step) or min_current_step <= 0:
+            raise ApiError(
+                422,
+                "invalid_options",
+                "min_current_step_a must be a positive finite number",
+            )
+        return float(min_current_step)
 
     @staticmethod
     def _parse_battery_model(model: Any) -> tuple[float, float, float]:

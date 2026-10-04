@@ -12,6 +12,7 @@ from .service import ApiError, Service
 SOC_ROUTE = "/v1/battery/soc/estimate"
 BATTERY_MODEL_ROUTE = "/v1/battery/model/simulate"
 OCV_CURVE_FIT_ROUTE = "/v1/battery/ocv/curve/fit"
+RESISTANCE_ESTIMATE_ROUTE = "/v1/battery/resistance/estimate"
 HEALTH_ROUTE = "/v1/battery/health/estimate"
 POWER_BUDGET_ROUTE = "/v1/power/budget/allocate"
 LOAD_SHED_ROUTE = "/v1/power/load-shed/decide"
@@ -59,6 +60,7 @@ class Handler(BaseHTTPRequestHandler):
             SOC_ROUTE,
             BATTERY_MODEL_ROUTE,
             OCV_CURVE_FIT_ROUTE,
+            RESISTANCE_ESTIMATE_ROUTE,
             HEALTH_ROUTE,
             POWER_BUDGET_ROUTE,
             LOAD_SHED_ROUTE,
@@ -96,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.simulate_battery_model(payload)
             elif self.path == OCV_CURVE_FIT_ROUTE:
                 result = self.service.fit_ocv_curve(payload)
+            elif self.path == RESISTANCE_ESTIMATE_ROUTE:
+                result = self.service.estimate_internal_resistance(payload)
             elif self.path == HEALTH_ROUTE:
                 result = self.service.estimate_health(payload)
             elif self.path == POWER_BUDGET_ROUTE:
