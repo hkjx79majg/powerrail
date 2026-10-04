@@ -21,6 +21,7 @@ DEFAULT_SMOOTHING_FACTOR = 0.25
 DEFAULT_RESET_GAP_S = 30.0
 DEFAULT_REGRESSION_THRESHOLD_PERCENT = 5.0
 DEFAULT_TREND_THRESHOLD_W_PER_HOUR = 0.0
+DEFAULT_MIN_VOLTAGE_STEP_V = 0.000001
 
 
 class ApiError(Exception):
@@ -341,6 +342,158 @@ class Service:
             "estimates": estimates,
             "final_soc": estimates[-1]["soc"],
             "final_terminal_voltage_v": estimates[-1]["terminal_voltage_v"],
+        }
+
+    def fit_ocv_curve(self, payload: Any) -> dict[str, Any]:
+        """Fit a monotone OCV curve from rest calibration measurements.
+
+        Measurements sharing a SoC merge into one knot; knot voltages
+        minimize the weighted sum of squared voltage residuals subject
+        to adjacent knots rising by at least ``min_voltage_step_v``.
+        Substituting ``z_k = y_k - k * min_voltage_step_v`` turns the
+        gap constraint into a plain monotonicity constraint, so the
+        weighted pool-adjacent-violators algorithm on the shifted
+        targets gives the exact least-squares solution.
+        """
+        if not isinstance(payload, dict):
+            raise ApiError(400, "invalid_json", "request body must be a JSON object")
+
+        measurements = payload.get("measurements")
+        if not isinstance(measurements, list) or len(measurements) < 2:
+            raise ApiError(
+                422,
+                "invalid_measurements",
+                "measurements must be an array with at least two items",
+            )
+        for measurement in measurements:
+            if not isinstance(measurement, dict):
+                raise ApiError(
+                    422,
+                    "invalid_measurements",
+                    "each measurement must be an object",
+                )
+
+        socs: list[float] = []
+        for measurement in measurements:
+            soc = measurement.get("soc")
+            if not _is_finite_number(soc) or not 0 <= soc <= 1:
+                raise ApiError(
+                    422, "invalid_soc", "soc must be a finite number within [0, 1]"
+                )
+            socs.append(float(soc))
+
+        voltages: list[float] = []
+        for measurement in measurements:
+            voltage = measurement.get("voltage_v")
+            if not _is_finite_number(voltage):
+                raise ApiError(
+                    422, "invalid_voltage", "voltage_v must be a finite number"
+                )
+            voltages.append(float(voltage))
+
+        weights: list[float] = []
+        for measurement in measurements:
+            weight = measurement.get("weight", 1.0)
+            if not _is_finite_number(weight) or weight <= 0:
+                raise ApiError(
+                    422, "invalid_weight", "weight must be a positive finite number"
+                )
+            weights.append(float(weight))
+
+        min_voltage_step = self._parse_fit_options(payload.get("options"))
+
+        knot_weight_sums: dict[float, float] = {}
+        knot_voltage_sums: dict[float, float] = {}
+        knot_sample_counts: dict[float, int] = {}
+        for soc, voltage, weight in zip(socs, voltages, weights):
+            knot_weight_sums[soc] = knot_weight_sums.get(soc, 0.0) + weight
+            knot_voltage_sums[soc] = (
+                knot_voltage_sums.get(soc, 0.0) + weight * voltage
+            )
+            knot_sample_counts[soc] = knot_sample_counts.get(soc, 0) + 1
+
+        unique_socs = sorted(knot_weight_sums)
+        knot_total = len(unique_socs)
+        if knot_total < 2:
+            raise ApiError(
+                422,
+                "insufficient_soc_span",
+                "measurements must cover at least two distinct soc values",
+            )
+
+        weight_sums = [knot_weight_sums[soc] for soc in unique_socs]
+        targets = [
+            knot_voltage_sums[soc] / knot_weight_sums[soc]
+            - index * min_voltage_step
+            for index, soc in enumerate(unique_socs)
+        ]
+
+        # Weighted PAVA on the shifted targets; each block is
+        # (weight_sum, weighted_target_sum, first knot index).
+        blocks: list[tuple[float, float, int]] = []
+        for index in range(knot_total):
+            blocks.append(
+                (weight_sums[index], weight_sums[index] * targets[index], index)
+            )
+            while len(blocks) >= 2:
+                prev_weight, prev_sum, prev_start = blocks[-2]
+                cur_weight, cur_sum, _ = blocks[-1]
+                if prev_sum / prev_weight <= cur_sum / cur_weight:
+                    break
+                blocks[-2:] = [
+                    (prev_weight + cur_weight, prev_sum + cur_sum, prev_start)
+                ]
+
+        knot_voltages = [0.0] * knot_total
+        block_starts = [start for _, _, start in blocks] + [knot_total]
+        for block_index, (block_weight, block_sum, _) in enumerate(blocks):
+            shifted = block_sum / block_weight
+            for index in range(block_starts[block_index], block_starts[block_index + 1]):
+                knot_voltages[index] = shifted + index * min_voltage_step
+
+        fitted_by_soc = {
+            soc: knot_voltages[index] for index, soc in enumerate(unique_socs)
+        }
+
+        residuals: list[dict[str, Any]] = []
+        weighted_error_sum = 0.0
+        weight_total = 0.0
+        max_abs_error = 0.0
+        for index in range(len(measurements)):
+            fitted = fitted_by_soc[socs[index]]
+            residual = voltages[index] - fitted
+            weighted_error_sum += weights[index] * residual * residual
+            weight_total += weights[index]
+            if abs(residual) > max_abs_error:
+                max_abs_error = abs(residual)
+            residuals.append(
+                {
+                    "index": index,
+                    "soc": measurements[index]["soc"],
+                    "measured_voltage_v": measurements[index]["voltage_v"],
+                    "fitted_voltage_v": fitted,
+                    "residual_voltage_v": residual,
+                }
+            )
+
+        curve = [
+            {
+                "soc": unique_socs[index],
+                "voltage_v": knot_voltages[index],
+                "sample_count": knot_sample_counts[unique_socs[index]],
+                "weight_sum": weight_sums[index],
+            }
+            for index in range(knot_total)
+        ]
+
+        return {
+            "status": "fitted",
+            "curve": curve,
+            "residuals": residuals,
+            "rmse_voltage_v": math.sqrt(weighted_error_sum / weight_total),
+            "max_abs_error_v": max_abs_error,
+            "measurement_count": len(measurements),
+            "knot_count": knot_total,
         }
 
     def estimate_health(self, payload: Any) -> dict[str, Any]:
@@ -3243,6 +3396,25 @@ class Service:
                 remaining = 0.0
                 break
         return remaining
+
+    @staticmethod
+    def _parse_fit_options(options: Any) -> float:
+        if options is None:
+            return DEFAULT_MIN_VOLTAGE_STEP_V
+        if not isinstance(options, dict):
+            raise ApiError(
+                422, "invalid_fit_options", "options must be an object"
+            )
+        min_voltage_step = options.get(
+            "min_voltage_step_v", DEFAULT_MIN_VOLTAGE_STEP_V
+        )
+        if not _is_finite_number(min_voltage_step) or min_voltage_step <= 0:
+            raise ApiError(
+                422,
+                "invalid_fit_options",
+                "min_voltage_step_v must be a positive finite number",
+            )
+        return float(min_voltage_step)
 
     @staticmethod
     def _parse_battery_model(model: Any) -> tuple[float, float, float]:
